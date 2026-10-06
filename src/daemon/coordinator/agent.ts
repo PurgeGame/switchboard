@@ -1847,15 +1847,18 @@ export class CoordinatorAgent {
       approved = true;
     }
     const task = this.assertDispatch(sessionId, ctx.taskId, approved);
-    if (ctx.taskId !== null && task.id !== ctx.taskId) throw Error("the checked task changed before delivery");
+    if (ctx.taskId !== null && task?.id !== ctx.taskId) throw Error("the checked task changed before delivery");
   }
 
   /** Public gate for delivery/auth integration. A human proposal approval is one scoped action, not autopilot. */
-  assertDispatch(sessionId: string, taskId?: string | null, humanApproved = false) {
+  assertDispatch(sessionId: string, taskId?: string | null, humanApproved = false): Task | null {
     if (this.mode !== "active") throw Error("Coordinator is paused or off; no dispatch");
     if (this.budget.exhausted) throw Error("Daily budget reached");
     if (this.excluded.has(sessionId)) throw Error("Session is excluded from coordination");
     if (!humanApproved) this.requireAutonomous(sessionId, "message");
+    // D35: a message the user approved, exact text to exact session (authorizeDelivery checks both),
+    // needs no task: it's their call, like a chat message they route. Their tap also ends any hold.
+    if (humanApproved && !taskId) return null;
     const task = this.taskFor(sessionId, taskId);
     if (!task) throw Error("Dispatch needs a task under a human grant");
     this.d.coordination.checkDispatch(task.id, sessionId);
@@ -1958,7 +1961,7 @@ export class CoordinatorAgent {
     // daemon restarts cannot bypass the cooldown while the first transport is pending.
     this.recordSent(s.id, text);
     // The outbox rechecks exactly this task and approval right before transport (authorizeDelivery).
-    const r = await this.d.send(s.id, text, { taskId: checked.id, proposalId: humanApproved ? proposalId : null, humanApproved });
+    const r = await this.d.send(s.id, text, { taskId: checked?.id ?? null, proposalId: humanApproved ? proposalId : null, humanApproved });
     if (!r.ok) {
       this.retries.fail(key, this.now());
       return refuse(`send failed: ${r.error ?? "unknown"}`, "error");

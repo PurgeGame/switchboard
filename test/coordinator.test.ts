@@ -196,6 +196,20 @@ describe("modes and authority", () => {
     expect(x.sent.at(-1)).toMatchObject({ sessionId: "mine", text: "[coordinator] Could you rebase onto main?" });
   });
 
+  test("a message the user approves reaches a session with no task or grant (D35); only that exact text", async () => {
+    const x = setup();
+    x.agent.setMode("active");
+    x.add("theirs"); // a session the user drives: no task, no grant
+    const b = (await x.agent.callTool("send_message", { sessionId: "theirs", text: "Carry the plan through to the end", reason: "user asked" })) as any;
+    expect(b.result.proposed).toBe(true);
+    const p = x.agent.proposals()[0];
+    await x.agent.approve(p.id);
+    expect(x.sent.at(-1)).toMatchObject({ sessionId: "theirs", text: "[coordinator] Carry the plan through to the end" });
+    const ctx = { taskId: null, proposalId: p.id, humanApproved: true };
+    expect(() => x.agent.authorizeDelivery("theirs", "[coordinator] Something else entirely", ctx)).toThrow(/doesn't match/);
+    expect(() => x.agent.authorizeDelivery("theirs", "[coordinator] Carry the plan through to the end", { ...ctx, humanApproved: false, proposalId: null })).toThrow();
+  });
+
   test("autopilot grants autonomy; exclusion revokes everything", async () => {
     const x = setup();
     x.agent.setMode("active");
