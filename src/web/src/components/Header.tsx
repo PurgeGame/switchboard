@@ -2,7 +2,50 @@ import type { AttentionCounts } from "../attention.ts";
 import { InboxIcon } from "./Icons.tsx";
 import { GameModeBadge } from "./Governor.tsx";
 import { SettingsPopover } from "./SettingsPopover.tsx";
-import type { ConnState, View } from "../store.ts";
+import { useStore, type ConnState, type View } from "../store.ts";
+import { gb } from "../format.ts";
+
+function Gauge({ label, value, tip, warn }: { label: string; value: string; tip: string; warn?: boolean }) {
+  return (
+    <span className="flex items-baseline gap-1.5" title={tip}>
+      <span className="text-ink-3">{label}</span>
+      <span className={`font-mono tabular-nums ${warn ? "text-amber" : "text-ink-2"}`}>{value}</span>
+    </span>
+  );
+}
+
+/** Machine load at a glance: CPU, RAM, memory pressure and (if any) GPU memory. Hidden on narrow screens. */
+function Gauges() {
+  const system = useStore((s) => s.system);
+  if (!system) return null;
+  const used = system.memTotalMB - system.memAvailableMB;
+  const gpu = system.gpu;
+  return (
+    <div className="hidden items-center gap-4 text-[12px] md:flex" aria-label="System load">
+      <Gauge label="CPU" value={`${Math.round(system.cpuPct)}%`} tip={`CPU across ${system.cores} cores`} warn={system.cpuPct > 90} />
+      <Gauge
+        label="RAM"
+        value={`${gb(used)}/${gb(system.memTotalMB)}G`}
+        tip={`${gb(used)} GB used of ${gb(system.memTotalMB)} GB. Swap used: ${gb(system.swapUsedMB)} GB`}
+        warn={used / system.memTotalMB > 0.9}
+      />
+      <Gauge
+        label="PSI"
+        value={system.psi.memory.toFixed(1)}
+        tip={`Memory pressure (some, 10s avg): ${system.psi.memory.toFixed(2)}%. CPU ${system.psi.cpu.toFixed(2)}%, IO ${system.psi.io.toFixed(2)}%`}
+        warn={system.psi.memory > 10}
+      />
+      {gpu && (
+        <Gauge
+          label="GPU"
+          value={`${gb(gpu.memUsedMB)}/${gb(gpu.memTotalMB)}G`}
+          tip={`${gpu.name}: ${gb(gpu.memUsedMB)} of ${gb(gpu.memTotalMB)} GB video memory, ${Math.round(gpu.utilPct)}% busy`}
+          warn={gpu.memUsedMB / gpu.memTotalMB > 0.9}
+        />
+      )}
+    </div>
+  );
+}
 
 
 function Segment({ n, label, color }: { n: number; label: string; color: string }) {
@@ -57,6 +100,7 @@ export function Header(props: {
   return (
     <header className="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 sm:gap-4 sm:px-4">
       <h1 className="sr-only text-[14px] font-semibold tracking-tight sm:not-sr-only">Switchboard</h1>
+      <Gauges />
       <div className="ml-auto flex items-center gap-2 sm:gap-4">
         <GameModeBadge />
         <AttentionCounter counts={props.counts} />
