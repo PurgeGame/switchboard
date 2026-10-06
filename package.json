@@ -1,0 +1,36 @@
+{
+  "name": "switchboard",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "dompurify": "^3.4.16",
+    "marked": "^18.1.0",
+    "qrcode-terminal": "^0.12.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/bun": "^1.4.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "playwright-core": "^1.63.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.3",
+    "ws": "^8.22.0"
+  },
+  "scripts": {
+    "daemon": "bun src/daemon/main.ts",
+    "dev:web": "vite --config src/web/vite.config.ts",
+    "build": "vite build --config src/web/vite.config.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "bun test test/",
+    "e2e": "bun test/e2e/run.ts"
+  },
+  "bin": {
+    "sb": "src/cli/sb.ts",
+    "switchboardd": "src/daemon/main.ts"
+  }
+}

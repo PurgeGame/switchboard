@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.sandbox/
+*.log
+.env
+.DS_Store
+/data/
+/tmp/
+docs/research/codex-protocol/ts/
+docs/research/codex-protocol/ts-experimental/
+docs/research/codex-protocol/schema/
+docs/research/codex-protocol/schema-experimental/

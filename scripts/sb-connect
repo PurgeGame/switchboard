@@ -1,0 +1,74 @@
+#!/bin/sh
+# sb-connect: open Switchboard on a remote machine from this one, authenticated by your SSH key.
+#
+#   sb-connect my-pc            tunnel (reused if already open), one-time login link, open the browser
+#   sb-connect --stop my-pc     close the background tunnel
+#   sb-connect --print my-pc    print the login link instead of opening a browser
+#
+# Needs only POSIX sh and OpenSSH here; no Bun, no checkout, no token stored on this machine.
+# How it works: a background SSH tunnel forwards localhost:PORT to the remote daemon's loopback
+# port (the daemon never listens on the network). Then, over the same SSH connection, the remote
+# `sb login` mints a single-use 60-second link. Whoever can SSH in as you can log in; nobody else.
+#
+# Environment:
+#   SB_PORT         daemon port, same on both sides (Host/Origin checks are strict). Default 7777.
+#   SB_REMOTE_DIR   Switchboard checkout on the remote. Default ~/switchboard.
+#
+# Install on a laptop:  ssh my-pc cat switchboard/scripts/sb-connect > ~/.local/bin/sb-connect && chmod +x ~/.local/bin/sb-connect
+set -eu
+
+port="${SB_PORT:-7777}"
+remote_dir="${SB_REMOTE_DIR:-~/switchboard}"
+action=open
+case "${1:-}" in
+  --stop) action=stop; shift ;;
+  --print) action=print; shift ;;
+  -h|--help|"") sed -n 2,19p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+host="${1:?usage: sb-connect [--stop|--print] <ssh-host>}"
+
+# One persistent SSH master per host: the tunnel lives on it and later calls reuse it.
+ctl_dir="${XDG_RUNTIME_DIR:-$HOME/.ssh}"
+ctl="$ctl_dir/sb-connect-%r@%h:%p"
+ssh_ctl() { ssh -o ControlPath="$ctl" "$@"; }
+
+if [ "$action" = stop ]; then
+  ssh_ctl -O exit "$host" 2>/dev/null && echo "Tunnel to $host closed." || echo "No tunnel to $host was open."
+  exit 0
+fi
+
+if ssh_ctl -O check "$host" 2>/dev/null; then
+  : # tunnel already up
+else
+  # -f -N: background, no command. ExitOnForwardFailure: fail loudly if the local port is taken.
+  if ! ssh -f -N -o ControlMaster=yes -o ControlPath="$ctl" -o ControlPersist=yes \
+      -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+      -L "127.0.0.1:$port:127.0.0.1:$port" "$host"; then
+    echo "Could not open the tunnel. If port $port is busy here, use another port on both sides:" >&2
+    echo "  start the remote daemon with SB_PORT=<port>, then run SB_PORT=<port> sb-connect $host" >&2
+    exit 1
+  fi
+fi
+
+# A login shell on the remote so Bun is on PATH. The link is single-use and expires in 60 s.
+out=$(ssh_ctl "$host" "bash -lc 'cd $remote_dir && SB_PORT=$port bun src/cli/sb.ts login'" 2>&1) || {
+  echo "The remote couldn't create a login link:" >&2
+  echo "$out" >&2
+  echo "Is Switchboard running there? Start it with: ssh $host 'cd $remote_dir && scripts/dev-restart.sh'" >&2
+  exit 1
+}
+url=$(printf '%s\n' "$out" | grep -o "http://127\.0\.0\.1:$port/auth?code=[A-Za-z0-9]*" | head -n 1)
+[ -n "$url" ] || { echo "Unexpected reply from the remote:" >&2; echo "$out" >&2; exit 1; }
+
+if [ "$action" = print ]; then
+  echo "$url"
+elif command -v open >/dev/null 2>&1 && [ "$(uname)" = Darwin ]; then
+  open "$url"
+elif command -v xdg-open >/dev/null 2>&1; then
+  xdg-open "$url" >/dev/null 2>&1 &
+elif command -v wslview >/dev/null 2>&1; then
+  wslview "$url"
+else
+  echo "Open this in your browser within 60 seconds:"; echo "$url"; exit 0
+fi
+echo "Switchboard on $host is open at http://127.0.0.1:$port (tunnel stays up; close it with: sb-connect --stop $host)."
