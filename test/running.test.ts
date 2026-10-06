@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { childrenIndex, runningCommand, type ProcInfo } from "../src/daemon/proc.ts";
+import { childrenIndex, runningCommand, runsSwitchboardMcp, type ProcInfo } from "../src/daemon/proc.ts";
 
 const proc = (pid: number, ppid: number, comm: string): ProcInfo => ({ pid, ppid, pgrp: pid, tpgid: 0, ttyNr: 0, comm, state: "S", startTime: 0, cpuTicks: 0, rssPages: 0 });
 
@@ -48,4 +48,15 @@ test("builds and plain commands are told apart; hooks and nothing-running give n
   expect(runningCommand(100, hook.procs, hook.kids, hook.argv, Date.now())).toBeUndefined();
   const idle = table([[100, 1, "claude", ["claude"]]]);
   expect(runningCommand(100, idle.procs, idle.kids, idle.argv, Date.now())).toBeUndefined();
+});
+
+test("a session that runs Switchboard's MCP proxy (an external coordinator) is recognized", () => {
+  const t = table([
+    [100, 1, "claude", ["claude"]],
+    [200, 100, "bun", ["bun", "/home/u/switchboard/src/cli/sb.ts", "mcp"]],
+    [300, 1, "claude", ["claude"]],
+    [400, 300, "node", ["node", "/mcp/other-server.js"]],
+  ]);
+  expect(runsSwitchboardMcp(100, t.kids, t.argv)).toBe(true);
+  expect(runsSwitchboardMcp(300, t.kids, t.argv)).toBe(false);
 });

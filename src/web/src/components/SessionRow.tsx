@@ -35,6 +35,11 @@ function SessionRowBase({ session: s, selected, unread, attention, autoDeadline,
         <span className="flex items-center gap-2">
           <ProviderGlyph provider={s.provider} />
           <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{sessionTitle(s)}</span>
+          {!!s.meta.coordinatorClient && (
+            <span title="Connected to Switchboard's coordinator tools (sb mcp)" className="shrink-0 rounded-full border border-line-strong px-1.5 text-[10px] text-ink-3">
+              Your coordinator
+            </span>
+          )}
           {unread && <span role="img" aria-label="Unread activity" title="New activity since you last opened this" className="h-2 w-2 shrink-0 rounded-full bg-focus" />}
           <StatusPill session={s} elapsed={elapsed} />
         </span>

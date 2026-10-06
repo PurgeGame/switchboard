@@ -107,6 +107,18 @@ describe("attention engine", () => {
     expect(engine.open(s.id)).toHaveLength(0);
   });
 
+  test("answering a held prompt in Switchboard settles every approval item for that session at once", () => {
+    const { engine, s } = setup();
+    // The registry sees the session waiting (one item), and the broker holds the prompt for you (another).
+    s.execution = "waiting_approval";
+    s.executionConfidence = "confirmed";
+    engine.onExecutionChange(s, "working", NOW + 1);
+    engine.raisePermission(s, { tool: "Bash", summary: "touch x", answerKey: "k1", recommendation: null });
+    expect(engine.open(s.id)).toHaveLength(2);
+    engine.settlePermission("k1", "answered in Switchboard");
+    expect(engine.open(s.id)).toHaveLength(0);
+  });
+
   test("dedupe: the same source event never raises twice", () => {
     const { engine, s, store } = setup();
     const e = store.insertEvent({ sessionId: s.id, sourceId: "dup", type: "turn_ended", ts: NOW + 5, data: { lastAgentMessage: "Proceed?" } })!;

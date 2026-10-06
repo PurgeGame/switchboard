@@ -562,8 +562,9 @@ export class CoordinatorAgent {
     }
   }
 
+  /** The coordinator's own session: the built-in process, or an external agent connected through `sb mcp`. */
   private isSelf(s: Session) {
-    return !!s.cwd && s.cwd.endsWith("/switchboard/coordinator");
+    return (!!s.cwd && s.cwd.endsWith("/switchboard/coordinator")) || !!s.meta.coordinatorClient;
   }
 
   /** Sessions whose turn ends matter: they own a task, were launched by us, or are on autopilot. */

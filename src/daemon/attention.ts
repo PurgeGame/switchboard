@@ -210,8 +210,17 @@ export class AttentionEngine {
 
   /** A held prompt is over: answered here, or it moved back to the session's own terminal. */
   settlePermission(answerKey: string, how: string) {
+    const outcome = how === "answered in Switchboard" ? "answered_ui" : "superseded";
+    const sessions = new Set<string>();
     for (const it of this.store.openAttention())
-      if (it.kind === "approval" && it.meta.answerKey === answerKey) this.resolve(it, how === "answered in Switchboard" ? "answered_ui" : "superseded", how);
+      if (it.kind === "approval" && it.meta.answerKey === answerKey) {
+        sessions.add(it.sessionId);
+        this.resolve(it, outcome, how);
+      }
+    // The registry's own "waiting for approval" item for the same prompt (it has no answer key)
+    // would otherwise stay counted until the session's status moves on.
+    for (const sid of sessions)
+      for (const it of this.store.openAttention(sid)) if (it.kind === "approval" && !it.meta.answerKey) this.resolve(it, outcome, how);
   }
 
   /** Visible record of a prompt the coordinator approved on its own. */

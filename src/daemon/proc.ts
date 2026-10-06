@@ -178,3 +178,12 @@ export function runningCommand(root: number, procs: Map<number, ProcInfo>, kids:
   }
   return best;
 }
+
+/** Does this process tree run Switchboard's MCP proxy (`sb mcp`)? That makes it a coordinator: yours, or the built-in one. */
+export function runsSwitchboardMcp(root: number, kids: Map<number, number[]>, argv: (pid: number) => string[]): boolean {
+  return descendants(root, kids).some((pid) => {
+    if (pid === root) return false;
+    const a = argv(pid);
+    return a.some((x) => x.endsWith("/coordinator/mcp-server.ts")) || (a.some((x) => x.endsWith("/src/cli/sb.ts")) && a.includes("mcp"));
+  });
+}

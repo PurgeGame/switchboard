@@ -5,7 +5,7 @@ import type { SbEvent, ServerPush, Session } from "../shared/types.ts";
 import type { Adapter, Discovered } from "./adapters/types.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
-import { childrenIndex, cmdlineOf, CpuSampler, descendants, rssMB, runningCommand, snapshot, type ProcInfo } from "./proc.ts";
+import { childrenIndex, cmdlineOf, CpuSampler, descendants, rssMB, runningCommand, runsSwitchboardMcp, snapshot, type ProcInfo } from "./proc.ts";
 import { applyEvent, blankSession, checkStalled, isRunning, mergeLiveStatus } from "./state.ts";
 import { JsonlTail, readHead } from "./tail.ts";
 import type { AttentionEngine } from "./attention.ts";
@@ -342,6 +342,14 @@ export class Registry {
         if (pid !== s.pid && (!top || c > top.cpuPct || (c === top.cpuPct && m > top.rssMB))) top = { pid, name: p.comm, cpuPct: c, rssMB: m };
       }
       const running = s.pid ? runningCommand(s.pid, procs, kids, (pid) => this.argvOf(pid, procs), now) : undefined;
+      // An agent connected to Switchboard's tools (`sb mcp`) is a coordinator: the UI labels it and
+      // the coordinator engine doesn't feed it its own events.
+      const client = !!s.pid && runsSwitchboardMcp(s.pid, kids, (pid) => this.argvOf(pid, procs));
+      if (!!s.meta.coordinatorClient !== client) {
+        if (client) s.meta.coordinatorClient = true;
+        else delete s.meta.coordinatorClient;
+        this.dirty.add(s.id);
+      }
       const next = { cpuPct: Math.round(cpu * 10) / 10, rssMB: Math.round(rss), procs: n, top: top && (top.cpuPct > 1 || top.rssMB > 200) ? { ...top, cpuPct: Math.round(top.cpuPct), rssMB: Math.round(top.rssMB) } : undefined, inferred: extra?.inferred || undefined, running };
       // Avoid churn: only push when something moved noticeably.
       const prev = s.resources;

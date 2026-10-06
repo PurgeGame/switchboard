@@ -285,10 +285,21 @@ function ExternalNote() {
   const c = useStore((s) => s.coordinator);
   const now = useNow();
   const seen = agentSeen(c?.lastToolCallAt ?? null, now);
+  // Its own session, recognized by the daemon from the `sb mcp` process it runs.
+  const own = useStore((s) => Object.values(s.sessions).find((x) => x.meta.coordinatorClient && !x.meta.coordinatorAgent && x.execution !== "ended"));
   return (
     <section aria-label="External coordinator" className="space-y-1 rounded-xl border border-line-strong bg-raised px-3.5 py-3 text-[13px]">
       <p className="text-ink-2">
-        The coordinator is your own agent, connected with <code className="font-mono text-[12px]">sb mcp</code>. Talk to it in its own window.
+        The coordinator is your own agent, connected with <code className="font-mono text-[12px]">sb mcp</code>. Talk to it in its own window
+        {own ? (
+          <>
+            {": "}
+            <button className="text-focus underline-offset-2 hover:underline" onClick={() => openSession(own.id)}>
+              {sessionTitle(own)}
+            </button>
+          </>
+        ) : null}
+        .
       </p>
       <p className={`text-[12px] ${seen.connected ? "text-green" : "text-ink-3"}`}>{seen.text}</p>
     </section>
