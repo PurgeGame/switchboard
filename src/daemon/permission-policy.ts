@@ -69,6 +69,16 @@ function gitSafe(root: string): boolean {
   } catch { return false; }
 }
 
+/** Git discovers the nearest `.git` above the cwd. One between the worktree root and the cwd (a
+ * nested repository, or a `.git` file pointing anywhere) has a config gitSafe never read. */
+function noNestedRepository(cwd: string, root: string): boolean {
+  for (let directory = cwd; directory !== root; directory = dirname(directory)) {
+    if (!insideRoot(directory, root)) return false;
+    try { lstatSync(join(directory, ".git")); return false; } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+  }
+  return true;
+}
+
 /** Snapshot only explicit paths for verification commands; suite internals are authorized.
  * Readers still get the bounded recursive secret/link check. No requested command is executed. */
 export function permissionFacts(info: PermissionInfo, root: string | null): SafetyFacts {
@@ -131,12 +141,14 @@ export function permissionFacts(info: PermissionInfo, root: string | null): Safe
         (facts.globs as Record<string, string[]>)[absolute] = matches;
       } else capture(absolute, command.recursive, !!command.git);
     }
-    for (const output of plan.outputs) capture(resolve(info.cwd, output));
-    // A `>` onto an existing file replaces its contents: ask Git (index names only, helpers off)
-    // whether it is tracked. Anything but a clean "not tracked" counts as tracked.
-    for (const output of plan.truncating) {
-      const absolute = resolve(info.cwd, output);
-      if (entries[absolute]?.kind !== "file") continue;
+    const writes = plan.commands.flatMap((c) => c.writes ?? []);
+    for (const output of [...plan.outputs, ...writes]) capture(resolve(info.cwd, output));
+    // A `>` onto an existing file replaces its contents, and an output option can replace a file
+    // or empty a directory: ask Git (index names only, helpers off) whether it holds anything
+    // tracked. Anything but a clean "not tracked" counts as tracked.
+    for (const output of [...plan.truncating, ...writes]) {
+      const absolute = resolve(info.cwd, output), kind = entries[absolute]?.kind;
+      if (kind !== "file" && !(kind === "directory" && writes.includes(output))) continue;
       const r = spawnSync("git", ["-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", relative(root, absolute)], {
         cwd: root, encoding: "utf8", timeout: 2000, maxBuffer: 200_000,
         env: { PATH: process.env.PATH, HOME: homedir(), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1" },
@@ -160,7 +172,7 @@ export function permissionFacts(info: PermissionInfo, root: string | null): Safe
         if (directory === root) break;
       }
     }
-    if (plan.commands.some((c) => c.git)) facts.gitSafe = gitSafe(root);
+    if (plan.commands.some((c) => c.git)) facts.gitSafe = gitSafe(root) && noNestedRepository(info.cwd, root);
     if (plan.commands.some((c) => /read-only-(?:stdin-)?(?:rg|grep)/.test(c.rule)) && (process.env.RIPGREP_CONFIG_PATH || process.env.GREP_OPTIONS)) return { root: null, paths: {} };
   } catch { /* Incomplete evidence means ask. */ }
   return facts;
