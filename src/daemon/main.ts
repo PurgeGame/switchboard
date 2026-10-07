@@ -5,9 +5,9 @@ import { ClaudeAdapter } from "./adapters/claude.ts";
 import { CodexAdapter } from "./adapters/codex.ts";
 import { ScannerAdapter } from "./adapters/scanner.ts";
 import { loadConfig, loadToken, paths, rotateCoordinatorToken } from "./config.ts";
-import { PermissionBroker, type PermissionInfo } from "./permissions.ts";
+import { PermissionBroker } from "./permissions.ts";
 import { retrySafeDenial } from "./permission-retry.ts";
-import { SafePermissionPolicy, deniedPermissionInfo, codexApprovalInput, inOwnWorktree } from "./permission-policy.ts";
+import { SafePermissionPolicy, deniedPermissionInfo, codexApprovalInfo, inOwnWorktree } from "./permission-policy.ts";
 import { deniedCallText, type DeniedToolCall } from "./adapters/tool-denial.ts";
 import { Store } from "./db.ts";
 import { startHttp } from "./http.ts";
@@ -369,21 +369,10 @@ for (const row of store.db.query("SELECT data FROM attention WHERE json_extract(
 codexLive.onApproval = (a) => {
   const sid = `codex:${a.threadId}`;
   const answerKey = `${a.threadId}:${a.rpcId}`;
-  const summary = a.reason ? `${a.reason}\n${a.summary}` : a.summary;
   const s = registry.sessions.get(sid);
-  // The tool comes from the request method, never from its free-form kind (a "kind" can't pass
-  // for a Claude tool name). Permission-widening requests are unknown tools: they always ask.
-  const isCommand = a.method === "item/commandExecution/requestApproval" || a.method === "execCommandApproval";
-  const isFiles = a.method === "item/fileChange/requestApproval" || a.method === "applyPatchApproval";
-  const info: PermissionInfo = {
-    sessionId: sid,
-    provider: "codex",
-    tool: isCommand ? "command" : isFiles ? "file change" : `codex ${a.method}`,
-    input: isCommand ? codexApprovalInput(a.raw ?? {}, a.rawCommand) : isFiles ? { paths: a.paths, grantRoot: a.grantRoot } : {},
-    summary,
-    // Where Codex will run it; else the thread's cwd from Switchboard's record.
-    cwd: a.cwd ?? s?.cwd ?? null,
-  };
+  // Tool from the request method; a command's cwd only from the request (codexApprovalInfo).
+  const info = codexApprovalInfo(a, s?.cwd ?? null);
+  const summary = info.summary;
   void permissions.decide(info).then(({ allow, recommendation }) => {
     if (allow) {
       try {

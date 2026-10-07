@@ -48,41 +48,83 @@ export const sensitivePath = (p: string) => p.split("/").some((s) =>
   || /\.(?:pem|key|p12|pfx|jks|keystore|db|sqlite[23]?)(?:[.-].*)?$/i.test(s));
 const ordinaryPath = (p: string) => !!p && p !== "-" && !/[\x00-\x1f\x7f$`~\\*?\[\]{}!:]/.test(p) && !p.split("/").includes("..");
 
-/** Whole quoted words, reviewed chain operators and output redirections. No substitutions,
- * variables, comments, background jobs, input redirections, groups or concatenated quoting. */
+export interface ShellWord { text: string; raw: string; quoted: boolean }
+export interface ShellCommand { words: ShellWord[]; redirects: { op: string; target?: ShellWord }[] }
+/** operators[i] joins commands[i] and commands[i + 1]. */
+export interface ShellSyntax { commands: ShellCommand[]; operators: string[] }
+
+/** Words bash and zsh treat as syntax in command position (bash keywords, zsh reserved words). */
+const RESERVED = new Set(["!", "[[", "]]", "{", "}", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in", "select", "then", "time", "until", "while", "foreach", "end", "repeat", "nocorrect", "always", "declare", "export", "float", "integer", "local", "readonly", "typeset"]);
+
+/**
+ * The accepted shell grammar: a deliberately small subset that bash, zsh and POSIX sh all split
+ * the same way, whatever their options (test/parser-differential.test.ts checks it against bash).
+ * Anything outside it asks. Only printable ASCII, separated by spaces (no tabs, CR or newlines);
+ * no `$`, backticks or backslashes anywhere. A word is exactly one of:
+ *  - unquoted, from [A-Za-z0-9 _ @ % + = : , . / - * [ ]] (no `~ ! # ^ ? { } ( ) < >`), not
+ *    starting with `=` and without `==` (zsh `=cmd` expansion, also after `=` with
+ *    MAGIC_EQUAL_SUBST); `*` and `[...]` are globs and are tracked as such;
+ *  - '...' with anything but `'` inside;
+ *  - "..." with no `!` (history expansion) and, per the above, no `$`, backtick or backslash.
+ * Quoted parts never touch another part (no concatenation). Operators: `;`, `|`, `&&`, `||`;
+ * redirections `>`, `>>`, `1>`, `1>>`, `2>`, `2>>` before a target word, and `2>&1`, `1>&2`.
+ * A word or redirection must be followed by a space, an operator or the end, so a redirection
+ * never touches the word before it (bash reads `12>x` as descriptor 12, zsh as the word `12`).
+ * No `&>` (in POSIX sh it is `&` then `>`), background jobs, input redirections or here-docs.
+ * In command position an unquoted word is only [A-Za-z0-9 _ . / + -] (no assignment `A=b`, no
+ * `a[...]` subscript, no glob) and not a reserved word.
+ */
+export function shellSyntax(command: string): ShellSyntax | null {
+  if (typeof command !== "string" || command.length > 16_384 || /[^\x20-\x7e]|[$`\\]/.test(command)) return null;
+  const commands: ShellCommand[] = [{ words: [], redirects: [] }], operators: string[] = [];
+  const re = / *(?:'([^']*)'(?=[ ;&|]|$)|"([^"!]*)"(?=[ ;&|]|$)|(2>&1|1>&2)(?=[ ;&|]|$)|([12]?>>?)|(&&|\|\||[;|])|([A-Za-z0-9_@%+=:,./*[\]-]+)(?=[ ;&|]|$))/y;
+  let end = 0;
+  let pending: { op: string; target?: ShellWord } | null = null;
+  while (end < command.trimEnd().length) {
+    re.lastIndex = end;
+    const m = re.exec(command);
+    if (!m) return null;
+    end = re.lastIndex;
+    const current = commands.at(-1)!;
+    if (m[3] || m[4] || m[5]) {
+      if (pending) return null;
+      if (m[3]) current.redirects.push({ op: m[3] });
+      if (m[4]) current.redirects.push(pending = { op: m[4] });
+      if (m[5]) {
+        if (!current.words.length) return null;
+        operators.push(m[5]);
+        commands.push({ words: [], redirects: [] });
+      }
+    } else {
+      const word: ShellWord = { text: m[1] ?? m[2] ?? m[6], raw: m[0].trimStart(), quoted: m[6] === undefined };
+      if (!word.quoted && (word.text.startsWith("=") || word.text.includes("=="))) return null;
+      // Command position: bash reads `a=` as an assignment and `a[` as an array subscript that may
+      // span spaces and operators (`a[|b]` is one word); keywords are syntax.
+      if (!pending && !current.words.length && !word.quoted && (!/^[A-Za-z0-9_./+-]+$/.test(word.text) || RESERVED.has(word.text))) return null;
+      if (pending) { pending.target = word; pending = null; }
+      else current.words.push(word);
+    }
+  }
+  return pending || commands.some((c) => !c.words.length) ? null : { commands, operators };
+}
+
 function sequence(command: unknown): { commands: string[][]; outputs: string[]; truncating: string[]; piped: boolean[]; globs: Set<string>[] } | null {
   if (Array.isArray(command)) {
     if (!command.length || !command.every((v) => typeof v === "string" && !/[\x00-\x1f\x7f]/.test(v))) return null;
     if (command.length === 3 && /^(?:\/bin\/|\/usr\/bin\/)?(?:bash|sh)$/.test(command[0]) && /^-l?c$/.test(command[1])) return sequence(command[2]);
     return { commands: [command], outputs: [], truncating: [], piped: [false], globs: [new Set()] };
   }
-  if (typeof command !== "string" || command.length > 16_384 || /[^\x20-\x7e]|[$`\\]/.test(command)) return null;
-  const commands: string[][] = [[]], outputs: string[] = [], truncating: string[] = [], piped = [false], globs: Set<string>[] = [new Set()];
-  const re = /\s*(?:'([^']*)'(?=\s|[;&|<>]|$)|"([^"]*)"(?=\s|[;&|<>]|$)|(2>&1|1>&2)(?=\s|[;&|]|$)|([12]?>>?|&>>?)|(&&|\|\||[;|])|([^\s'";&|<>(){}?!#~]+)(?=\s|[;&|<>]|$))/gy;
-  let end = 0, target = false, truncate = false;
-  while (end < command.trimEnd().length) {
-    re.lastIndex = end;
-    const m = re.exec(command);
-    if (!m) return null;
-    end = re.lastIndex;
-    if (m[3] || m[4] || m[5]) {
-      if (target) return null;
-      if (m[4]) { target = true; truncate = !m[4].endsWith(">>"); }
-      if (m[5]) {
-        if (!commands.at(-1)!.length) return null;
-        commands.push([]); globs.push(new Set());
-        piped.push(m[5] === "|");
-      }
-    } else {
-      const word = m[1] ?? m[2] ?? m[6];
-      // Unquoted: zsh expands a leading `=` to a command's path; `*` and `[...]` glob.
-      if (m[6] !== undefined && word.startsWith("=")) return null;
-      if (m[6] !== undefined && !target && /[*[\]]/.test(word)) globs.at(-1)!.add(word);
-      if (target) { outputs.push(word); if (truncate) truncating.push(word); target = false; }
-      else commands.at(-1)!.push(word);
-    }
-  }
-  return target || commands.some((c) => !c.length) ? null : { commands, outputs, truncating, piped, globs };
+  const syntax = typeof command === "string" ? shellSyntax(command) : null;
+  if (!syntax) return null;
+  const redirects = syntax.commands.flatMap((c) => c.redirects.filter((r) => r.target));
+  return {
+    commands: syntax.commands.map((c) => c.words.map((w) => w.text)),
+    outputs: redirects.map((r) => r.target!.text),
+    truncating: redirects.filter((r) => !r.op.endsWith(">>")).map((r) => r.target!.text),
+    piped: syntax.commands.map((_, i) => syntax.operators[i - 1] === "|"),
+    // Unquoted `*` and `[...]` glob.
+    globs: syntax.commands.map((c) => new Set(c.words.filter((w) => !w.quoted && /[*[\]]/.test(w.text)).map((w) => w.text))),
+  };
 }
 
 /** Parse the complete call before inspecting any paths or granting any part of a chain. */
@@ -99,10 +141,12 @@ export function permissionPlan(info: PermissionInfo): PermissionPlan | null {
   const parsed = sequence(i.command);
   if (!parsed) return null;
   // A shell glob expands into any number of words: only verification path operands, whose every
-  // match is checked, may contain one. A pattern or option value never may.
+  // match is checked, may contain one. A pattern or option value never may. Nor may a word that
+  // starts with the wildcard (a match like `--reporter-outfile=x` would become an option) or uses
+  // `**` (recursive with bash globstar).
   const commands = parsed.commands.map((argv, index) => {
     const globs = parsed.globs[index], verification = verificationPlan(argv);
-    if (verification) return [...globs].every((w) => !verification.opaque?.includes(w) && verification.paths.includes(w)) ? verification : null;
+    if (verification) return [...globs].every((w) => !verification.opaque?.includes(w) && verification.paths.includes(w) && !/^[*[\]]/.test(w) && !w.includes("**")) ? verification : null;
     return globs.size ? null : readPlan(argv, parsed.piped[index]);
   });
   if (commands.some((c) => !c)) return null;
@@ -192,6 +236,10 @@ export function classifySafePermission(info: PermissionInfo, facts: SafetyFacts)
     if (command.script) {
       const pkg = facts.package;
       if (!pkg || !checkPath(pkg.path) || facts.paths[pkg.path]?.kind !== "file" || !Object.hasOwn(pkg.scripts, command.script) || typeof pkg.scripts[command.script] !== "string" || !pkg.scripts[command.script].trim()) return ask("Verification script is not defined in the repository's package.json");
+      // The runner starts the script in the package's directory, so its relative path and output
+      // arguments resolve there, not in the cwd they were checked from.
+      if (path.dirname(pkg.path) !== cwd && (command.paths.some((p) => p !== ".") || command.writes?.length))
+        return ask("Package script arguments would resolve in the package's directory, not the working directory they were checked in");
     }
     if (!command.paths.every((p) => checkPath(p, command.recursive, command.verification))) return ask("Path is outside the worker's worktree, sensitive, unresolved or unsafe to read recursively");
     // Output options (`--outDir`, `-o`, `--junitxml`, `--target-dir`...) write, replace or empty

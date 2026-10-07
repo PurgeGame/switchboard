@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Store } from "./db.ts";
 import type { PermissionInfo } from "./permissions.ts";
 import type { DeniedToolCall } from "./adapters/tool-denial.ts";
+import type { CodexApproval } from "./adapters/codex-live.ts";
 import { classifySafePermission, executesProjectCode, insideRoot, permissionPlan, sensitivePath, type PathFact, type SafetyFacts, type SafeVerdict } from "./safe-permission.ts";
 import type { AutoApproveSetting } from "./config.ts";
 import { verifyDir } from "./grants.ts";
@@ -127,13 +128,15 @@ export function permissionFacts(info: PermissionInfo, root: string | null): Safe
       if (command.verification && p.includes("*")) {
         // Only filename globs: shell expansion through a wildcard directory could traverse
         // a symlink the glob walker skips. Enumerating names also includes broken symlinks.
-        const base = dirname(absolute);
-        if (base.includes("*") || capture(base)?.kind !== "directory") continue;
-        const pattern = new Bun.Glob(absolute.slice(base.length + 1));
+        const base = dirname(absolute), glob = absolute.slice(base.length + 1);
+        if (base.includes("*") || /[?[\]{}!\\]/.test(glob) || glob.includes("**") || capture(base)?.kind !== "directory") continue;
+        // A superset of what the shell may expand `*` to under any options: case-insensitive
+        // (nocaseglob, zsh NO_CASE_GLOB) and including dotfiles (dotglob, GLOB_DOTS).
+        const pattern = new RegExp(`^${glob.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "is");
         const matches: string[] = [];
         for (const name of readdirSync(base)) {
           if (--remaining < 0) return { root: null, paths: {} };
-          if (!pattern.match(name)) continue;
+          if (!pattern.test(name)) continue;
           const path = join(base, name);
           matches.push(path);
           capture(path);
@@ -259,10 +262,37 @@ export class SafePermissionPolicy {
   }
 }
 
-/** Provider protocol metadata is inert; every other extra field must go to the classifier. */
+/**
+ * Provider protocol metadata is inert; every other extra field must go to the classifier, which
+ * asks on any it does not know. Not inert: `cwd` (kept, so it must equal the cwd the decision
+ * used), `kind` other than "command" ("writeStdin" approves input to a running process, not the
+ * command named) and a non-null `approvalId` (a sub-command callback of the zsh exec bridge).
+ */
 export function codexApprovalInput(raw: Record<string, unknown>, command: unknown): Record<string, unknown> {
   const input: Record<string, unknown> = { command };
-  const metadata = new Set(["command", "cwd", "threadId", "thread", "turnId", "itemId", "callId", "approvalId", "reason", "kind", "availableDecisions", "commandActions", "parsedCmd"]);
-  for (const [key, value] of Object.entries(raw)) if (!metadata.has(key) && value !== null && value !== undefined) input[key] = value;
+  const metadata = new Set(["command", "threadId", "thread", "turnId", "itemId", "callId", "reason", "availableDecisions", "commandActions", "parsedCmd"]);
+  for (const [key, value] of Object.entries(raw)) {
+    if (metadata.has(key) || value === null || value === undefined || (key === "kind" && value === "command")) continue;
+    input[key] = value;
+  }
   return input;
+}
+
+/**
+ * The PermissionInfo for a Codex approval request. The tool comes from the request method, never
+ * from its free-form kind; permission-widening requests are unknown tools and always ask. A
+ * command runs where the request says: with no string `cwd` in it the decision has no cwd and
+ * asks (the session's recorded cwd can be stale or another turn's).
+ */
+export function codexApprovalInfo(a: CodexApproval, sessionCwd: string | null): PermissionInfo {
+  const isCommand = a.method === "item/commandExecution/requestApproval" || a.method === "execCommandApproval";
+  const isFiles = a.method === "item/fileChange/requestApproval" || a.method === "applyPatchApproval";
+  return {
+    sessionId: `codex:${a.threadId}`,
+    provider: "codex",
+    tool: isCommand ? "command" : isFiles ? "file change" : `codex ${a.method}`,
+    input: isCommand ? codexApprovalInput(a.raw ?? {}, a.rawCommand) : isFiles ? { paths: a.paths, grantRoot: a.grantRoot } : {},
+    summary: a.reason ? `${a.reason}\n${a.summary}` : a.summary,
+    cwd: isCommand ? a.cwd : a.cwd ?? sessionCwd,
+  };
 }

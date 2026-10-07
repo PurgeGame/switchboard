@@ -33,12 +33,15 @@ const RUNNERS: Record<string, Options> = {
   go: {
     flags: ["-race", "-v", "-short", "-json", "-cover", "-benchmem", "-failfast", "-c", "-x"],
     values: ["-run", "-bench", "-count", "-timeout", "-parallel", "-cpu", "-shuffle", "-vet", "-covermode"],
-    outputs: ["-o", "-outputdir", "-coverprofile", "-cpuprofile", "-memprofile", "-blockprofile", "-mutexprofile", "-trace"], operands: "go",
+    // Not -outputdir: the profile outputs below resolve inside it, not where they were checked.
+    outputs: ["-o", "-coverprofile", "-cpuprofile", "-memprofile", "-blockprofile", "-mutexprofile", "-trace"], operands: "go",
   },
+  // No --out/--cache-path: Foundry resolves them from the project root (the nearest
+  // foundry.toml), not from the cwd they would be checked in.
   forge: {
     flags: ["--gas-report", "--via-ir", "--offline", "--force", "--no-cache", "--json", "--summary", "--detailed"],
     values: ["--match-test", "--no-match-test", "--match-contract", "--no-match-contract", "--fuzz-runs", "--fuzz-seed", "--threads", "-j"],
-    paths: ["--match-path", "--no-match-path"], outputs: ["--out", "--cache-path"], short: /^-[qv]+$/,
+    paths: ["--match-path", "--no-match-path"], short: /^-[qv]+$/,
   },
   make: { flags: ["--no-print-directory", "--keep-going", "--silent"], values: ["--jobs", "-j"], short: /^-j[1-9][0-9]*$/, operands: "none" },
 };
@@ -68,9 +71,11 @@ function argumentsPlan(args: string[], options: Options): { paths: string[]; wri
         const v = eq < 0 ? args[++n] : arg.slice(eq + 1);
         if (typeof v !== "string") return null;
         if (eq < 0) opaque.push(v);
-        if (flag === "--cov-report" && v.includes(":")) {
+        if (flag === "--cov-report") {
+          // Without `:path`, html/xml/json/lcov/annotate write their default file or directory
+          // (coverage.xml, htmlcov/...) unchecked: only terminal reports go without a target.
           const [format, ...target] = v.split(":");
-          if (!["html", "xml", "json", "lcov", "annotate"].includes(format) || !value(target.join(":"), "output")) return null;
+          if (!target.length ? !["term", "term-missing"].includes(format) : !["html", "xml", "json", "lcov", "annotate"].includes(format) || !value(target.join(":"), "output")) return null;
         } else if (!value(v, kind)) return null;
       } else if (eq < 0 && (options.flags?.includes(arg) || options.short?.test(arg))) continue;
       else return null;
