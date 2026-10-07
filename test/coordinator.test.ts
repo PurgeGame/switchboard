@@ -13,6 +13,7 @@ import { resolveTier, rubricTier, suggestTier } from "../src/daemon/coordinator/
 import { coordinatorArgs, DENIED_BUILTINS, type RuntimeLike } from "../src/daemon/coordinator/runtime.ts";
 import { TOOL_NAMES } from "../src/daemon/coordinator/tools.ts";
 import type { SbEvent, Session } from "../src/shared/types.ts";
+import { withMessageLimits } from "./message-limits.ts";
 
 const MIN = 60_000;
 // Grants need an existing directory; tests share one named "r" (worktree paths end in /wt/r/…).
@@ -63,7 +64,7 @@ function setup(over: any = {}) {
   const gov: string[] = [];
   const rt = new FakeRuntime();
   let n = 0;
-  const cfg = mergeCoordinatorConfig({ ...over });
+  const cfg = mergeCoordinatorConfig(withMessageLimits(over));
   const agent = new CoordinatorAgent({
     db: store.db,
     coordination,
@@ -84,6 +85,7 @@ function setup(over: any = {}) {
       return p;
     },
     escalate: (_s, title) => escalations.push(title),
+    usage: () => ({ ts: 0, claude: { available: false, source: "s", asOf: null, windows: [], note: "off" }, codex: { available: true, source: "s", asOf: 0, plan: "pro", windows: [{ label: "7d", usedPct: 5, remainingPct: 95, resetsAt: 86_400_000 }] } }),
     governor: { throttle: (id) => (gov.push(`throttle ${id}`), true), snapshot: () => ({ ok: 1 }) },
     push: () => {},
     runtime: rt,
@@ -234,6 +236,16 @@ describe("modes and authority", () => {
     expect(((await x.agent.callTool("get_resources", {})) as any).result).toEqual({ ok: 1 });
   });
 
+  test("get_usage: a small read-only answer, usable while paused", async () => {
+    const x = setup();
+    x.agent.setMode("paused");
+    const r = (await x.agent.callTool("get_usage", {})) as any;
+    expect(r.ok).toBe(true);
+    expect(r.result.codex.windows).toEqual([{ w: "7d", used: 5, left: 95, resets: "1970-01-02T00:00:00.000Z" }]);
+    expect(r.result.claude).toMatchObject({ available: false, note: "off", asOf: null, ageMs: null, stale: true, windows: [] });
+    expect(r.result.codex).toMatchObject({ available: true, asOf: "1970-01-01T00:00:00.000Z", ageMs: 0, stale: false, error: null });
+  });
+
   test("tool surface: no approvals, shell or git tools; unknown tools refused; reason required", async () => {
     const x = setup();
     x.agent.setMode("active");
@@ -264,6 +276,14 @@ describe("rate limits, budget, retries, loops", () => {
     const six = Array.from({ length: 6 }, (_, i) => ({ sessionId: "a", at: t0 + i * MIN, text: `distinct message number ${i} about topic ${"xyz".repeat(i)}` }));
     expect(checkSend(six, "a", "a seventh, unrelated note", lim2, t0 + 7 * MIN)).toMatchObject({ ok: false, reason: expect.stringMatching(/per hour/) });
     expect(similarity("[coordinator] hello there", "hello there!")).toBeGreaterThan(0.85);
+  });
+
+  test("an explicit 0 turns the per-time limits off; near-duplicates are still dropped", () => {
+    const lim = { perSessionCooldownMs: 0, perSessionPerHour: 0, dedupeWindowMs: 60 * MIN };
+    const t0 = 1_000_000_000;
+    const many = Array.from({ length: 20 }, (_, i) => ({ sessionId: "a", at: t0 + i * 1000, text: `distinct message ${i} ${"q".repeat(i * 5)}` }));
+    expect(checkSend(many, "a", "and one more, about something new", lim, t0 + 21_000).ok).toBe(true);
+    expect(checkSend(many, "a", "distinct message 3 qqqqqqqqqqqqqqq", lim, t0 + 21_000)).toMatchObject({ ok: false, outcome: "dropped" });
   });
 
   test("enforced through the agent too", async () => {
@@ -507,6 +527,25 @@ test("activity in unrelated sessions never wakes the coordinator on its own", ()
   expect(x.agent.flush()).toContain("users-own"); // rides along with the next real wake
 });
 
+test("a headless SDK run's one-shot prompt, or an id the coordinator can't see, is not a human message", () => {
+  const x = setup();
+  x.agent.setMode("active");
+  x.agent.flush();
+  x.rt.finish(0);
+  const sdk = x.add("sdk-run");
+  sdk.kind = "headless";
+  sdk.meta.entrypoint = "sdk-py";
+  x.add("typed-in");
+  x.tick(1000);
+  const msg = (sessionId: string) => x.agent.onEvent({ sessionId, type: "user_msg", ts: x.now(), data: { text: "Review this change for security vulnerabilities." } } as any);
+  msg("sdk-run");
+  msg("never-listed");
+  expect(x.agent.activity().filter((a) => a.action === "human_override")).toHaveLength(0);
+  expect(x.agent.flush()).toBeNull();
+  msg("typed-in"); // a real, listed session still counts
+  expect(x.agent.activity().filter((a) => a.action === "human_override")).toHaveLength(1);
+});
+
 test("launches without a worktree, or with a destructive-looking brief, are held for approval", async () => {
   const x = setup();
   x.agent.setMode("active");
@@ -530,4 +569,131 @@ test("similar but distinct actions are not repeated work", async () => {
   x.agent.setMode("active");
   for (const n of [1, 2, 3, 4, 5]) expect((await x.createTask({ title: `Write n${n}.txt: river poem`, acceptance: ["exists"], reason: "r" })).ok).toBe(true);
   expect(x.agent.mode).toBe("active");
+});
+
+describe("claims let worktree tasks run in parallel (they meet only at merge)", () => {
+  const wt = join(dirname(R), "wt");
+  const claimsOf = (x: ReturnType<typeof setup>, owner: string) => x.coordination.claims(["active", "suspect", "waiting"]).filter((c) => c.owner === owner);
+
+  test("a worker in its own worktree claims its scope there, not in the shared tree", async () => {
+    const x = setup();
+    const { worker } = await withWorker(x);
+    const held = claimsOf(x, worker).map((c) => c.resource);
+    expect(held.length).toBeGreaterThan(0);
+    expect(held.every((r) => r.startsWith(`path:${wt}/`))).toBe(true);
+    expect(x.coordination.claims().some((c) => c.resource.startsWith(`path:${R}/`))).toBe(false);
+  });
+
+  test("two tasks on the same files both launch, each in its own worktree; a claim on the shared tree doesn't hold them", async () => {
+    const x = setup();
+    x.agent.setMode("active");
+    x.add("human1");
+    x.coordination.claim("human1", `path:${R}/src/shared.ts`);
+    const ids: string[] = [];
+    for (const title of ["Refactor the parser", "Add parser tests"]) {
+      const t = (await x.createTask({ title, acceptance: ["a"], scope: { paths: ["src/shared.ts"], resources: [] }, reason: "r" })) as any;
+      const l = (await x.agent.callTool("launch_session", { taskId: t.result.id, repo: R, reason: "parallel" })) as any;
+      expect(l.ok).toBe(true);
+      ids.push(l.result.sessionId);
+    }
+    const [a, b] = ids.map((id) => claimsOf(x, id).map((c) => c.resource));
+    expect(a).toHaveLength(1);
+    expect(b).toHaveLength(1);
+    expect(a[0]).not.toBe(b[0]);
+  });
+
+  test("a claim on the shared tree doesn't block messages or checkpoints to a worker in its own worktree", async () => {
+    const x = setup();
+    const { worker, task } = await withWorker(x);
+    for (const c of claimsOf(x, worker)) x.coordination.release(c.id, "human");
+    x.add("human1");
+    x.coordination.claim("human1", `path:${R}/src/**`);
+    x.tick(11 * 60_000); // past the (test fixture's) per-session cooldown
+    const m = (await x.agent.callTool("send_message", { sessionId: worker, text: "Also cover the empty input case.", taskId: task.id, reason: "r" })) as any;
+    expect(m.ok).toBe(true);
+    x.tick(11 * 60_000);
+    const cp = (await x.agent.callTool("request_checkpoint", { sessionId: worker, taskId: task.id, reason: "r" })) as any;
+    expect(cp.ok).toBe(true);
+    // Whatever it re-holds is in its own worktree: it never takes the shared tree's files.
+    expect(claimsOf(x, worker).every((c) => c.resource.startsWith(`path:${wt}/`))).toBe(true);
+  });
+
+  test("an owner in the shared tree is still gated: no message while someone else holds its files", async () => {
+    const x = setup();
+    x.agent.setMode("active");
+    x.add("mine");
+    const t = x.authorizeSession("mine");
+    x.agent.setAutopilot("mine", true);
+    for (const c of claimsOf(x, "mine")) x.coordination.release(c.id, "human");
+    x.add("human1");
+    x.coordination.claim("human1", `path:${R}/src/**`);
+    const m = (await x.agent.callTool("send_message", { sessionId: "mine", text: "Go ahead with it.", taskId: t.id, reason: "r" })) as any;
+    expect(m.ok).toBe(false);
+    expect(m.error).toMatch(/blocked by claim/);
+  });
+
+  test("a task moved from a worktree worker to a session in the shared tree claims the shared files, not the old worktree", async () => {
+    const x = setup();
+    const { worker, task } = await withWorker(x);
+    x.add("mine");
+    x.agent.setAutopilot("mine", true);
+    x.coordination.updateTask(task.id, { owner: "mine" }, "human");
+    expect(x.coordination.task(task.id)!.worktree).toStartWith(wt); // the stale record a reassignment leaves
+    const mine = claimsOf(x, "mine").map((c) => c.resource);
+    expect(mine.length).toBeGreaterThan(0);
+    expect(mine.every((r) => r.startsWith(`path:${R}/`))).toBe(true);
+    expect(worker).not.toBe("mine");
+  });
+
+  test("a launch held up by a shared resource waits, and doesn't use up its failed-launch retries", async () => {
+    const x = setup();
+    x.agent.setMode("active");
+    const o = x.coordination.createObjective("Ported", "", undefined, "human");
+    x.coordination.grantObjective(o.id, { root: R, resources: ["port:3000"] }, "human");
+    const t = (await x.createTask({ title: "Run the dev server checks", objectiveId: o.id, acceptance: ["a"], scope: { paths: ["src/dev.ts"], resources: ["port:3000"] }, reason: "r" })) as any;
+    expect(t.ok).toBe(true);
+    x.add("human1");
+    const held = x.coordination.claim("human1", "port:3000").claim;
+    for (let i = 0; i < x.cfg.limits.maxRetries + 2; i++) {
+      const l = (await x.agent.callTool("launch_session", { taskId: t.result.id, repo: R, reason: "r" })) as any;
+      expect(l.ok).toBe(false);
+      expect(l.error).toMatch(/^waiting: claim \d+ on port:3000 is held by human1/);
+    }
+    x.coordination.release(held.id, "human");
+    expect(((await x.agent.callTool("launch_session", { taskId: t.result.id, repo: R, reason: "r" })) as any).ok).toBe(true);
+  });
+});
+
+test("get_state is compact by default: open work only, long fields previewed, and the options widen it", async () => {
+  const x = setup();
+  x.agent.setMode("active");
+  const o = x.humanObjective();
+  const mk = (i: number) =>
+    x.coordination.createTask({ title: `Task ${i} ${"t".repeat(300)}`, description: "d".repeat(5000), objectiveId: o.result.id, scope: { paths: [`src/big-${i}.ts`], resources: [] }, acceptance: ["a"] }, "human");
+  const ids: string[] = [];
+  for (let i = 0; i < 40; i++) ids.push(mk(i).id);
+  // 30 finished tasks carrying big results and evidence (what blew up the full dump).
+  for (const id of ids.slice(0, 30)) {
+    const t = x.coordination.task(id)!;
+    (x.coordination as any).saveTask({ ...t, status: "verified", result: "r".repeat(8000), evidence: [{ at: 1, by: "w", text: "e".repeat(3000) }] });
+  }
+  const full = JSON.stringify(x.coordination.snapshot()).length;
+  const r: any = ((await x.agent.callTool("get_state", {})) as any).result;
+  const size = JSON.stringify(r).length;
+  expect(full).toBeGreaterThan(200_000);
+  expect(size).toBeLessThan(12_000);
+  expect(r.tasks).toHaveLength(10);
+  expect(r.counts.tasksByStatus.verified).toBe(30);
+  expect(r.tasks[0].description.length).toBeLessThanOrEqual(200);
+  expect(r.tasks[0].result).toBeUndefined();
+  expect(r.settings).toBeDefined();
+  const fin: any = ((await x.agent.callTool("get_state", { include: ["finished"] })) as any).result;
+  expect(fin.tasks).toHaveLength(40);
+  const one: any = ((await x.agent.callTool("get_state", { taskId: ids[0] })) as any).result;
+  expect(one.tasks).toHaveLength(1);
+  expect(one.tasks[0].result.length).toBe(8000);
+  const byObj: any = ((await x.agent.callTool("get_state", { objectiveId: o.result.id })) as any).result;
+  expect(byObj.tasks).toHaveLength(10);
+  const det: any = ((await x.agent.callTool("get_state", { include: ["details"] })) as any).result;
+  expect(det.tasks[0].description.length).toBe(5000);
 });

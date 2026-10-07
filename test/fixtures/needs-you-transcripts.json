@@ -1,0 +1,112 @@
+[
+  {
+    "name": "classifier refusal with permission request before explanation",
+    "messages": [
+      "Please implement it.",
+      "The auto-mode classifier denied the call. Can you allow it so I can continue?\n\nAutomatic approval review rejected the command because it writes outside the permitted scope."
+    ],
+    "waiting": true,
+    "humanGate": true
+  },
+  {
+    "name": "permission imperative without question mark",
+    "messages": [
+      "Run the check.",
+      "The classifier denied this call. Please approve the command before I can continue."
+    ],
+    "waiting": true,
+    "humanGate": true
+  },
+  {
+    "name": "request for missing data",
+    "messages": [
+      "Connect the service.",
+      "Please provide the staging URL.\n\nThe rest of the implementation is ready."
+    ],
+    "waiting": true,
+    "humanGate": true
+  },
+  {
+    "name": "question followed by test results",
+    "messages": [
+      "Add a cache.",
+      "Do you prefer Redis or SQLite?\n\nTests: 42 passed."
+    ],
+    "waiting": true
+  },
+  {
+    "name": "ordinary choice",
+    "messages": [
+      "Add a cache.",
+      "Which eviction policy do you want, LRU or LFU?"
+    ],
+    "waiting": true
+  },
+  {
+    "name": "waiting on approval",
+    "messages": [
+      "Ship it.",
+      "I need your approval to publish this release."
+    ],
+    "waiting": true,
+    "humanGate": true
+  },
+  {
+    "name": "completed work",
+    "messages": [
+      "Fix it.",
+      "Implemented the fix. All tests pass."
+    ],
+    "waiting": false
+  },
+  {
+    "name": "denied but recovered",
+    "messages": [
+      "Run tests.",
+      "The classifier denied the first attempt. I used the approved command instead. All tests pass."
+    ],
+    "waiting": false
+  },
+  {
+    "name": "coordinator handles remaining work",
+    "messages": [
+      "Coordinate it.",
+      "The coordinator will retry the worker when a slot opens. No action is needed from you."
+    ],
+    "waiting": false
+  },
+  {
+    "name": "quoted question is not a new ask",
+    "messages": [
+      "Document the dialog.",
+      "The example dialog now reads:\n\n> Can you approve this command?\n\nDocumentation updated."
+    ],
+    "waiting": false
+  },
+  {
+    "name": "question inside code",
+    "messages": [
+      "Add a prompt example.",
+      "Done.\n\n```text\nPlease approve the command.\n```"
+    ],
+    "waiting": false
+  },
+  {
+    "name": "only the last assistant message counts",
+    "messages": [
+      "Add a cache.",
+      "Which cache do you prefer?",
+      "Redis.",
+      "Implemented Redis. Tests pass."
+    ],
+    "waiting": false
+  },
+  {
+    "name": "target question before verification footer",
+    "messages": [
+      "Deploy it.",
+      "Which branch should I deploy?\n\nThe build passed."
+    ],
+    "waiting": true
+  }
+]

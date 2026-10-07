@@ -25,7 +25,7 @@ export function AutoBanner({ sessionId }: { sessionId: string }) {
       {pending ? (
         <>
           <div className="flex items-center gap-2 text-amber">
-            <StatusIcon name="spinner" spin width={13} height={13} />
+            <StatusIcon name="active" width={13} height={13} />
             <span className="font-medium tabular-nums">Auto-continuing in {countdown(pending.deadline, now)}s</span>
             <button onClick={cancel} className="ml-auto rounded border border-amber/60 px-2 py-0.5 hover:bg-amber/10">
               Cancel
@@ -52,7 +52,7 @@ export function AutoBanner({ sessionId }: { sessionId: string }) {
 export function AutoChip({ deadline, now }: { deadline: number; now: number }) {
   return (
     <span className="pill tone-amber inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10.5px] font-medium tabular-nums">
-      <StatusIcon name="spinner" spin width={11} height={11} />
+      <StatusIcon name="active" width={11} height={11} />
       Auto-continuing in {countdown(deadline, now)}s
     </span>
   );

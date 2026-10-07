@@ -31,7 +31,7 @@ export function AttachmentStrip({ items, onRemove }: { items: Attachment[]; onRe
           <img src={a.preview} alt="Attached image" className={`h-full w-full object-cover ${a.status === "ready" ? "" : "opacity-40"}`} />
           {a.status === "uploading" && (
             <span className="absolute inset-0 flex items-center justify-center text-ink" role="status" aria-label="Uploading">
-              <StatusIcon name="spinner" spin width={18} height={18} />
+              <StatusIcon name="active" width={18} height={18} />
             </span>
           )}
           {a.status === "error" && (

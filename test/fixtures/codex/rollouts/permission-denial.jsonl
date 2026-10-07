@@ -1,0 +1,5 @@
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-denial"},"timestamp":"2026-10-07T10:00:00.000Z","ordinal":1}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"read-src","arguments":"{\"cmd\": \"rg -n 'permission|approval' src\", \"workdir\": \"/workspace/app\", \"max_output_tokens\": 2000}"},"timestamp":"2026-10-07T10:00:01.000Z","ordinal":2}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"read-src","output":"exec_command failed: automatic approval review denied the action\nReason: Source access needs explicit user authorization."},"timestamp":"2026-10-07T10:00:02.000Z","ordinal":3}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"The source search was denied. May I retry this exact command?"}]}},"timestamp":"2026-10-07T10:00:03.000Z","ordinal":4}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-denial","duration_ms":5000},"timestamp":"2026-10-07T10:00:04.000Z","ordinal":5}

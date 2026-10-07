@@ -61,14 +61,14 @@ describe("session state", () => {
   test("stall needs silence AND no CPU", () => {
     const s = blankSession("s", "claude", "tui", "x");
     applyEvent(s, ev("turn_started", 0));
-    s.resources = { cpuPct: 80, rssMB: 1, procs: 2 };
+    s.resources = { cpuPct: 80, rssMB: 1, procs: 1 };
     expect(checkStalled(s, 11 * 60_000, 10 * 60_000)).toBe(false); // busy command
     s.resources.cpuPct = 0;
     expect(checkStalled(s, 11 * 60_000, 10 * 60_000)).toBe(true);
-    expect(s.execution).toBe("stalled");
-    expect(s.executionConfidence).toBe("inferred");
+    expect(s.execution).toBe("working");
+    expect(s.executionConfidence).toBe("confirmed");
     applyEvent(s, ev("tool_call", 11 * 60_000 + 1));
-    expect(checkStalled(s, 11 * 60_000 + 2, 10 * 60_000)).toBe(true);
+    expect(checkStalled(s, 11 * 60_000 + 2, 10 * 60_000)).toBe(false);
     expect(s.execution).toBe("working");
   });
 });
@@ -129,5 +129,19 @@ describe("http guards", () => {
     expect(allowedOrigin(`http://${remote}`, 7777, remote)).toBe(false);
     expect(allowedOrigin(`https://${remote}.evil.com`, 7777, remote)).toBe(false);
     expect(allowedOrigin(`https://${remote}`, 7777)).toBe(false);
+  });
+
+  test("a session whose last event is turn_ended is idle at its prompt, never stalled", () => {
+    const s = blankSession("s", "claude", "tui", "x");
+    applyEvent(s, ev("turn_started", 0));
+    applyEvent(s, ev("turn_ended", 1000));
+    // The provider's registry still says busy (e.g. a background Agent runs), and the CPU is quiet.
+    mergeLiveStatus(s, { execution: "working", confidence: "confirmed" }, 2000);
+    s.resources = { cpuPct: 0, rssMB: 1, procs: 1 };
+    expect(checkStalled(s, 60 * 60_000, 10 * 60_000)).toBe(false);
+    expect(s.execution).toBe("working");
+    // A new turn that goes quiet still stalls.
+    applyEvent(s, ev("turn_started", 61 * 60_000));
+    expect(checkStalled(s, 80 * 60_000, 10 * 60_000)).toBe(true);
   });
 });

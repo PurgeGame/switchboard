@@ -21,7 +21,7 @@ export class Notifier {
   ) {}
 
   notify(item: AttentionItem, s: Session) {
-    if (!this.cfg.desktop || this.sent.has(item.id) || item.historical) return;
+    if (!this.cfg.desktop || this.sent.has(item.id) || item.historical || item.meta.autoApproved || item.meta.autoPending) return;
     if (s.cwd && this.cfg.ignore.some((p) => s.cwd!.includes(p))) return; // test/sandbox sessions
     if (!URGENT.has(item.kind) && !(item.kind === "finished" && this.cfg.finished)) return;
     this.sent.add(item.id);

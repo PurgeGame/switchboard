@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Attachment } from "./Attachments.tsx";
 import { AttachmentStrip, imageDropProps } from "./Attachments.tsx";
 import { PaperclipIcon } from "./Icons.tsx";
+import { insertedAtOnce } from "../send.ts";
 
 const MAX_HEIGHT = 240;
 
@@ -23,10 +24,12 @@ export interface MessageBoxProps {
   compact?: boolean;
   textareaRef?: React.RefObject<HTMLTextAreaElement | null>;
   onKeyDown?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  /** Text was pasted into the box (keyboard, menu, right-click, or a large insert that wasn't typed). */
+  onPasteText?: () => void;
 }
 
 /** Paste the clipboard into the box at the cursor; images become attachments. */
-async function pasteFromClipboard(el: HTMLTextAreaElement, value: string, onChange: (v: string) => void, attach: (files: File[]) => void) {
+async function pasteFromClipboard(el: HTMLTextAreaElement, value: string, onChange: (v: string) => void, attach: (files: File[]) => void, onText?: () => void) {
   const files: File[] = [];
   let text = "";
   try {
@@ -40,6 +43,7 @@ async function pasteFromClipboard(el: HTMLTextAreaElement, value: string, onChan
   }
   if (files.length) attach(files);
   if (!text) return;
+  onText?.();
   const start = el.selectionStart ?? value.length;
   const end = el.selectionEnd ?? value.length;
   onChange(value.slice(0, start) + text + value.slice(end));
@@ -91,13 +95,19 @@ export function MessageBox(p: MessageBoxProps) {
           ref={area}
           value={p.value}
           rows={1}
-          onChange={(e) => p.onChange(e.target.value)}
-          onPaste={imageDropProps(p.attachments.attach).onPaste}
+          onChange={(e) => {
+            if (p.onPasteText && insertedAtOnce(p.value, e.target.value)) p.onPasteText();
+            p.onChange(e.target.value);
+          }}
+          onPaste={(e) => {
+            if (e.clipboardData.getData("text/plain")) p.onPasteText?.();
+            imageDropProps(p.attachments.attach).onPaste(e);
+          }}
           onContextMenu={(e) => {
             // Right-click pastes, like a terminal (Shift+right-click keeps the browser menu).
             if (e.shiftKey || !navigator.clipboard) return;
             e.preventDefault();
-            void pasteFromClipboard(e.currentTarget, p.value, p.onChange, p.attachments.attach);
+            void pasteFromClipboard(e.currentTarget, p.value, p.onChange, p.attachments.attach, p.onPasteText);
           }}
           onKeyDown={(e) => {
             p.onKeyDown?.(e);

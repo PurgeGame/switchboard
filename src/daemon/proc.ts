@@ -18,9 +18,9 @@ export interface ProcInfo {
 const PAGE_KB = 4; // x86_64
 const HZ = 100;
 
-export function readStat(pid: number): ProcInfo | null {
+export function readStat(pid: number, procRoot = "/proc"): ProcInfo | null {
   try {
-    const s = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const s = readFileSync(`${procRoot}/${pid}/stat`, "utf8");
     const close = s.lastIndexOf(")");
     const comm = s.slice(s.indexOf("(") + 1, close);
     const f = s.slice(close + 2).split(" ");
@@ -42,11 +42,10 @@ export function readStat(pid: number): ProcInfo | null {
   }
 }
 
-export function listPids(): number[] {
+export function listPids(procRoot = "/proc"): number[] {
   const out: number[] = [];
-  for (const n of readdirSync("/proc")) {
-    const c = n.charCodeAt(0);
-    if (c >= 48 && c <= 57) out.push(+n);
+  for (const n of readdirSync(procRoot)) {
+    if (/^\d+$/.test(n)) out.push(+n);
   }
   return out;
 }
@@ -81,17 +80,17 @@ export function descendants(root: number, kids: Map<number, number[]>): number[]
   return out;
 }
 
-export function cwdOf(pid: number): string | null {
+export function cwdOf(pid: number, procRoot = "/proc"): string | null {
   try {
-    return readlinkSync(`/proc/${pid}/cwd`);
+    return readlinkSync(`${procRoot}/${pid}/cwd`);
   } catch {
     return null;
   }
 }
 
-export function cmdlineOf(pid: number): string[] {
+export function cmdlineOf(pid: number, procRoot = "/proc"): string[] {
   try {
-    return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+    return readFileSync(`${procRoot}/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
   } catch {
     return [];
   }

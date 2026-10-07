@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { Store } from "../src/daemon/db.ts";
 import { Coordination } from "../src/daemon/coordination.ts";
 import { CoordinatorAgent } from "../src/daemon/coordinator/agent.ts";
@@ -26,17 +29,22 @@ function fixture() {
 
 test("authority regression: claudeSelfGrantViaMcp creates only a proposal", async () => {
   const { store, coordination, agent } = fixture();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "sb-self-grant-")));
   try {
     const r: any = await agent.callTool("create_objective", {
       title: "Self-grant",
       reason: "agent says user asked",
       granted: true,
-      root: "/arbitrary",
+      root,
     });
     expect(coordination.snapshot().objectives).toHaveLength(0);
     expect(r.result.proposed).toBe(true);
+    // A root the approval would refuse isn't even proposed.
+    expect((await agent.callTool("create_objective", { title: "Self-grant", reason: "r", granted: true, root: "/arbitrary" })).ok).toBe(false);
+    expect(coordination.snapshot().objectives).toHaveLength(0);
   } finally {
     store.db.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

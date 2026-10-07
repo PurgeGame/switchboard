@@ -10,10 +10,12 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Author, DispatchContext, OutboxMessage, SbEvent, SendMethod, SendMode, Session } from "../shared/types.ts";
 import { DeliveryError, sendPeerMessage } from "./adapters/claude-peer.ts";
 import type { CodexLive } from "./adapters/codex-live.ts";
-import { cmdlineOf } from "./proc.ts";
+import { readStat, ttyOf } from "./proc.ts";
+import { findTranscriptProcess, sessionProcessError } from "./session-process.ts";
 import type { Store } from "./db.ts";
 import type { Registry } from "./registry.ts";
 import type { Uploads } from "./uploads.ts";
+import type { EndGuard } from "./coordinator/auto-end.ts";
 
 export interface TerminalSender {
   /** Can we inject into this session's terminal right now (bridge connected, terminal mapped)? */
@@ -25,6 +27,8 @@ export interface TerminalSender {
    */
   send(s: Session, text: string, images?: string[]): Promise<TerminalResult>;
   interrupt(s: Session): Promise<TerminalResult>;
+  /** Clear the composer before submitting the provider's exit command. */
+  quit?(s: Session): Promise<TerminalResult>;
 }
 
 export interface TerminalResult {
@@ -66,6 +70,7 @@ export function fingerprint(req: SendRequest): string {
   const parts: unknown[] = [FINGERPRINT_VERSION, req.sessionId, req.author ?? "human", req.method ?? null, req.mode ?? "auto", req.text.trim(), req.images ?? []];
   // The authority context is part of the request: the same key can't carry a different task or approval.
   if (req.context) parts.push(req.context.taskId, req.context.proposalId, req.context.humanApproved);
+  if (req.context?.userChat !== undefined) parts.push(req.context.userChat);
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 
@@ -97,7 +102,7 @@ export class Messenger {
 
   /** Available send methods for a session, best first. */
   methods(s: Session): SendMethod[] {
-    if (s.execution === "ended") return [];
+    if (s.execution === "ended" || this.ending.has(s.id)) return [];
     const out: SendMethod[] = [];
     if (s.provider === "codex" && s.meta.onDaemon) out.push("codex-daemon");
     if (this.terminal?.canSend(s)) out.push("terminal");
@@ -249,37 +254,103 @@ export class Messenger {
     throw new SendError(pinned ? `this session is driven via ${pinned}, which can't interrupt it` : "interrupt is not supported for this session", 409);
   }
 
-  /**
-   * End a session for the user: stop its turn if it's working, then type its own exit command
-   * (/exit for Claude, /quit for Codex) through the guarded terminal path. Without a reachable
-   * terminal, signal the agent process, but only a confirmed pid that really is claude/codex.
-   * History stays on disk either way.
-   */
-  async end(sessionId: string): Promise<{ ok: boolean; how: string; error?: string }> {
+  /** Explicit closes (UI and coordinator) share claim/launch cleanup. Never touches git. */
+  onEnded: ((sessionId: string) => number[]) | null = null;
+  private ending = new Map<string, Promise<{ ok: boolean; how: string; error?: string; releasedClaims?: number[] }>>();
+  endWaitMs = 3000;
+  endSignalWaitMs = 3000;
+
+  end(sessionId: string, guard?: EndGuard): Promise<{ ok: boolean; how: string; error?: string; releasedClaims?: number[] }> {
+    const pending = this.ending.get(sessionId);
+    if (pending) return pending;
+    const run = this.endOnce(sessionId, guard).finally(() => this.ending.delete(sessionId));
+    this.ending.set(sessionId, run);
+    return run;
+  }
+
+  private async endOnce(sessionId: string, guard?: EndGuard): Promise<{ ok: boolean; how: string; error?: string; releasedClaims?: number[] }> {
     const s = this.registry.sessions.get(sessionId);
     if (!s) throw new SendError("unknown session", 404);
-    if (s.execution === "ended") return { ok: true, how: "already ended" };
-    if (s.execution === "working") {
-      await this.interrupt(sessionId).catch(() => null);
-      await Bun.sleep(1500);
+    const recheck = async () => {
+      const blocked = await guard?.();
+      if (blocked) throw new SendError(`auto-end cancelled: ${blocked}`, 409);
+    };
+    if (guard) await recheck();
+    let identity = { pid: s.pid, startTime: Number(s.meta.processStartTime ?? 0) };
+    const finish = async (how: string) => {
+      if (s.provider === "codex" && s.meta.onDaemon) await this.codex.unsubscribe(s.nativeId);
+      const current = this.registry.sessions.get(s.id);
+      const live = current?.pid ? readStat(current.pid) : null;
+      if (current?.pidConfidence === "confirmed" && live && live.state !== "Z" && (live.pid !== identity.pid || live.startTime !== identity.startTime))
+        return { ok: false, how, error: "This conversation restarted while ending; its new process and claims were left alone." };
+      this.registry.confirmEnded(s.id, identity);
+      this.pinned.delete(s.id);
+      this.store.deleteLock(s.id);
+      const releasedClaims = this.onEnded?.(s.id) ?? [];
+      return { ok: true, how, releasedClaims };
+    };
+    if (s.execution === "ended") return finish("already ended");
+    if (s.provider !== "claude" && s.provider !== "codex") throw new SendError("this provider cannot be ended here", 409);
+    // Capture identity BEFORE awaiting anything. Resolve inferred mappings from the open
+    // transcript, never from the guessed PID (or the shared app-server's process).
+    const resolved = s.pidConfidence !== "confirmed" ? findTranscriptProcess(s) : null;
+    if (resolved?.error) throw new SendError(resolved.error, 409);
+    const pid = resolved?.process?.pid ?? s.pid;
+    if (!pid) throw new SendError("Switchboard cannot identify this session's process safely. End it in its own terminal.", 409);
+    const initial = readStat(pid);
+    if (!initial || initial.state === "Z") return finish("process already exited");
+    const startTime = initial.startTime;
+    const expectedStart = resolved?.process?.startTime ?? s.meta.processStartTime;
+    if (expectedStart !== undefined && expectedStart !== startTime)
+      throw new SendError("the original agent process has changed; refresh the session before ending it", 409);
+    identity = { pid, startTime };
+    const target: Session = { ...s, pid, pidConfidence: "confirmed", tty: ttyOf(pid), meta: { ...s.meta, processStartTime: startTime } };
+    const verify = () => {
+      const error = sessionProcessError(target, { pid, startTime });
+      if (error) throw new SendError(error, 409);
+    };
+    const gone = () => {
+      const p = readStat(pid);
+      return !p || p.startTime !== startTime || p.state === "Z";
+    };
+    const wait = async (ms: number) => {
+      const deadline = Date.now() + ms;
+      while (!gone() && Date.now() < deadline) await Bun.sleep(Math.min(100, Math.max(0, deadline - Date.now())));
+      return gone();
+    };
+    if (guard) await recheck();
+    verify();
+    if (s.execution === "working" || s.execution.startsWith("waiting") || s.execution === "stalled") {
+      // Codex tools run in the shared daemon, so interrupt that turn even if terminal input
+      // was the pinned send path. Never signal the shared daemon itself.
+      if (s.provider === "codex" && s.meta.onDaemon) await this.codex.interrupt(s.nativeId).catch(() => null);
+      else if (this.terminal?.canSend(target)) await this.terminal.interrupt(target).catch(() => null);
+      await Bun.sleep(300);
     }
-    if (this.terminal?.canSend(s)) {
-      const r = await this.terminal.send(s, s.provider === "codex" ? "/quit" : "/exit");
-      if (r.ok) return { ok: true, how: "typed the exit command" };
-      if (r.wrote !== false) return { ok: false, how: "terminal", error: `may not have ended: ${r.error ?? "unknown"}` };
+    let typed = false;
+    if (!gone() && this.terminal?.canSend(target)) {
+      if (guard) await recheck();
+      verify();
+      const r = await (this.terminal.quit?.(target) ?? this.terminal.send(target, s.provider === "codex" ? "/quit" : "/exit")).catch(() => ({ ok: false }));
+      typed = r.ok;
+      // A bridge timeout may still have delivered the command. Check exit and continue the
+      // signal ladder against the SAME process instead of abandoning an uncertain write.
+      if (await wait(this.endWaitMs)) return finish(typed ? "typed the exit command" : "process exited");
     }
-    const pid = s.pid;
-    if (pid && s.pidConfidence === "confirmed") {
-      const cmd = cmdlineOf(pid).join(" ");
-      if (!/(^|\/)(claude|codex)(\s|$)|@openai\/codex|claude-code/.test(cmd)) return { ok: false, how: "signal", error: "that process doesn't look like the agent; not touching it" };
-      try {
-        process.kill(pid, "SIGTERM");
-        return { ok: true, how: "asked the process to exit" };
-      } catch (e) {
-        return { ok: false, how: "signal", error: (e as Error).message };
+    for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+      if (gone()) return finish("process exited");
+      if (guard) await recheck();
+      verify();
+      try { process.kill(pid, signal); }
+      catch (e) {
+        if (gone()) return finish("process exited");
+        return { ok: false, how: signal, error: (e as Error).message };
+      }
+      if (await wait(this.endSignalWaitMs)) {
+        return finish(`${typed ? "typed the exit command, then " : ""}ended with ${signal}`);
       }
     }
-    throw new SendError("Switchboard can't reach this session to end it: close it in its own window", 409);
+    return { ok: false, how: "SIGKILL", error: "The agent is still running; its claims have not been released." };
   }
 
   /** The human settles an uncertain delivery after looking at the session. */

@@ -1,5 +1,5 @@
 import type { Session, Task, TaskStatus } from "../../shared/types.ts";
-import type { Tone } from "./status.ts";
+import { sessionTitle, type Tone } from "./status.ts";
 
 export const TASK_STATUS: Record<TaskStatus, { label: string; tone: Tone }> = {
   blocked: { label: "Blocked", tone: "redmuted" },
@@ -24,7 +24,7 @@ export const TIER: Record<Task["tier"], string> = { deep: "Deep", standard: "Sta
 
 export const sessionName = (sessions: Record<string, Session>, id: string): string => {
   const s = sessions[id];
-  return s ? s.name || s.goal || s.id : id;
+  return s ? sessionTitle(s) : id;
 };
 
 /** Prerequisites that are not yet verified. */

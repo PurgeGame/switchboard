@@ -15,6 +15,11 @@ export interface TurnEndClass {
 }
 
 const ASK = /\b(should i|shall i|do you want(?: me)?|would you like(?: me)?|want me to|can you confirm|could you confirm|please confirm|let me know|which (?:one|option|approach|of these|would you)|what would you like|how would you like|do you prefer|are you ok with|okay to|ok to proceed|proceed\?|go ahead\?|(?:y\/n)|\[y\/n\])/i;
+// Read requests across the final message: a permission explanation often follows the ask.
+const REQUEST = /\b(?:(?:please|could you|can you|would you|you (?:need to|must))\s+(?:allow|approve|authorize|confirm|choose|select|pick|provide|send|share|enter|reply|answer|upload|paste|enable|grant|decide|tell me)|(?:i need|i'm waiting for|waiting (?:for|on))\s+(?:you(?:r)?|the user(?:'s)?|human)|(?:your|human)\s+(?:approval|permission|confirmation|input|decision)\s+(?:is (?:needed|required)|before)|(?:allow|approve|confirm|choose|select|reply|provide|paste|upload)\b[^.!?]{0,120}\b(?:to continue|before i can|so i can))\b/i;
+const WHICH_INPUT = /\b(?:which (?:branch|repo(?:sitory)?|environment|target|file|version|name)|what (?:is your|should|would|do you)|where (?:should|do you)|when (?:should|do you)|how (?:should|would you))\b[^?]*\?/i;
+const HUMAN_GATE = /\b(?:permission|approval|authorize|allow|denied|blocked|classifier|human|user input)\b/i;
+
 const CONTINUE_ASK = /\b(shall i|should i|want me to|would you like me to|do you want me to|ready to|ok(?:ay)? to)\s+(?:go ahead|proceed|continue|keep going|carry on|move on|start|begin|implement|do (?:it|that|this|the rest)|apply|run|finish|tackle|work on)\b|\b(?:proceed|continue|go ahead|keep going)\s*(?:with[^?]{0,80})?\?\s*$/i;
 const OPTIONS = /(^|\n)\s*(?:\d+[.)]|[-*]|\(?[a-d]\))\s+\S.*(\n\s*(?:\d+[.)]|[-*]|\(?[a-d]\))\s+\S.*){1,}/;
 const CHOICE = /\b(which|or)\b[^?]{0,200}\?|\b(option [a-d1-9]|approach [a-d1-9])\b/i;
@@ -33,16 +38,21 @@ function tail(text: string): string {
 export function classifyTurnEnd(text: string | null | undefined): TurnEndClass {
   const t = (text ?? "").trim();
   if (!t) return { question: "no", continuationAsk: false, realChoice: false, outcome: "unclear", questionText: null };
-  const last = tail(t);
+  // Quoted transcripts and code examples are not requests from this assistant.
+  const prose = t.replace(/```[\s\S]*?(?:```|$)/g, "").replace(/^\s*>.*$/gm, "");
+  const paras = prose.split(/\n\s*\n/).filter((p) => p.trim());
+  const request = paras.filter((p) => REQUEST.test(p) || ASK.test(p) || WHICH_INPUT.test(p)).at(-1);
+  const last = (request ?? tail(prose)).trim();
   const lastLine = last.split("\n").filter((l) => l.trim()).at(-1) ?? "";
   const endsWithQ = /\?\s*[)*_`"']*\s*$/.test(lastLine);
   const askWords = ASK.test(last);
-  const options = OPTIONS.test(last) && (endsWithQ || askWords);
-  const continuationAsk = (endsWithQ || askWords) && CONTINUE_ASK.test(last) && !CHOICE.test(last.replace(CONTINUE_ASK, ""));
-  const realChoice = options || (endsWithQ && CHOICE.test(last) && !continuationAsk);
+  const directRequest = REQUEST.test(last);
+  const options = OPTIONS.test(last) && (endsWithQ || askWords || directRequest);
+  const continuationAsk = !directRequest && !HUMAN_GATE.test(prose) && (endsWithQ || askWords) && CONTINUE_ASK.test(last) && !CHOICE.test(last.replace(CONTINUE_ASK, ""));
+  const realChoice = directRequest || options || (endsWithQ && CHOICE.test(last) && !continuationAsk) || (askWords && HUMAN_GATE.test(prose));
 
   let question: TurnEndClass["question"];
-  if (endsWithQ && (askWords || options || last.length < 400)) question = "yes";
+  if (directRequest || (endsWithQ && (askWords || options || last.length < 400))) question = "yes";
   else if (options || (askWords && /\b(let me know|please confirm|which)\b/i.test(last))) question = "yes";
   else if (endsWithQ || askWords) question = "ambiguous";
   else question = "no";

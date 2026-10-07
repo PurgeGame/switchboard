@@ -1,6 +1,6 @@
 import type { AttentionItem, AttentionKind, Outcome, PerspectiveGroup, Resolution, Session } from "../../shared/types.ts";
 import { clip } from "./format.ts";
-import { needsYou, type IconName, type Tone } from "./status.ts";
+import { needsYou, sessionTitle, type IconName, type Tone } from "./status.ts";
 
 export type AttentionGroup = "needs" | "failed" | "finished" | "stalled" | "other";
 
@@ -64,7 +64,7 @@ export const openItems = (all: Record<number, AttentionItem>) => Object.values(a
 
 export function recentlyResolved(all: Record<number, AttentionItem>, limit = 50): AttentionItem[] {
   return Object.values(all)
-    .filter((i) => i.status === "resolved")
+    .filter((i) => i.status === "resolved" && i.kind !== "stalled")
     .sort((a, b) => (b.resolvedAt ?? 0) - (a.resolvedAt ?? 0))
     .slice(0, limit);
 }
@@ -112,8 +112,9 @@ export function sessionRank(s: Session, items: AttentionItem[] | undefined): num
   if (needsYou(s) || groups.has("needs")) return 0;
   if (groups.has("failed") || s.execution === "failed" || s.execution === "interrupted") return 1;
   if (groups.has("finished")) return 2;
-  if (groups.has("stalled") || s.execution === "stalled") return 3;
+  if (groups.has("stalled")) return 3;
   switch (s.execution) {
+    case "stalled": // old snapshots carry an unconfirmed guess; treat it as ordinary work
     case "working":
       return 4;
     case "unknown":
@@ -140,5 +141,5 @@ export function subjectName(item: AttentionItem, sessions: Record<string, Sessio
   const gid = groupIdOf(item);
   if (gid) return groups[gid] ? `Perspectives: ${clip(groups[gid].prompt, 40)}` : "Perspectives group";
   const s = sessions[item.sessionId];
-  return s ? (s.name || s.goal || s.id) : item.sessionId;
+  return s ? sessionTitle(s) : item.sessionId;
 }

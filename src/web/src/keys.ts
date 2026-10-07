@@ -1,7 +1,6 @@
 import { useEffect } from "react";
-import { isAckable } from "./attention.ts";
 import { focusComposer } from "./send.ts";
-import { acknowledge, getState, setReplyOpen, selectInboxItem, selectSession, selectTask, setContextOpen, setInboxOpen, setSearch, setView, showList, toggleInbox } from "./store.ts";
+import { getState, selectSession, selectTask, setContextOpen, setInboxOpen, setSearch, setView, showList, toggleInbox } from "./store.ts";
 import { COORDINATOR_ID, openSession } from "./store.ts";
 
 function isTyping(t: EventTarget | null): boolean {
@@ -9,21 +8,12 @@ function isTyping(t: EventTarget | null): boolean {
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
 }
 
-/** Global shortcuts: j/k move, Enter opens, / search, i inbox, a acknowledge, g w / g s switch view, Esc clears. */
+/** Global shortcuts: j/k move, Enter opens, / search, i inbox, g w / g s switch view, Esc clears. */
 export function useShortcuts(orderedIds: string[], inboxOrder: number[], searchRef: React.RefObject<HTMLInputElement | null>) {
   useEffect(() => {
     let gPending = 0;
     const move = (delta: number) => {
-      if (getState().inboxOpen) {
-        const { inboxSelectedId } = getState();
-        const at = inboxSelectedId !== null ? inboxOrder.indexOf(inboxSelectedId) : -1;
-        const next = inboxOrder[Math.min(inboxOrder.length - 1, Math.max(0, at + delta))];
-        if (next !== undefined) {
-          selectInboxItem(next);
-          document.querySelector(`[data-inbox-id="${next}"]`)?.scrollIntoView({ block: "nearest" });
-        }
-        return;
-      }
+      if (getState().inboxOpen) return;
       const { selectedId } = getState();
       const at = selectedId ? orderedIds.indexOf(selectedId) : -1;
       const next = orderedIds[Math.min(orderedIds.length - 1, Math.max(0, at + delta))];
@@ -56,20 +46,8 @@ export function useShortcuts(orderedIds: string[], inboxOrder: number[], searchR
           break;
         case "r": {
           e.preventDefault(); // keep the keystroke out of the composer we are about to focus
-          const { inboxOpen, inboxSelectedId, attention, sessions, selectedId, replyOpenId } = getState();
-          const item = inboxOpen && inboxSelectedId !== null ? attention[inboxSelectedId] : undefined;
-          if (inboxOpen) {
-            if (item?.kind === "question" && (sessions[item.sessionId]?.sendMethods.length ?? 0) > 0) {
-              if (replyOpenId === item.id) focusComposer(`reply:${item.id}`);
-              else setReplyOpen(item.id);
-            }
-          } else if (selectedId) focusComposer(`sess:${selectedId}`);
-          break;
-        }
-        case "a": {
-          const { inboxOpen, inboxSelectedId, attention } = getState();
-          const item = inboxSelectedId !== null ? attention[inboxSelectedId] : undefined;
-          if (inboxOpen && item && isAckable(item.kind)) void acknowledge(item.id);
+          const { selectedId, inboxOpen } = getState();
+          if (!inboxOpen && selectedId) focusComposer(`sess:${selectedId}`);
           break;
         }
         case "j":

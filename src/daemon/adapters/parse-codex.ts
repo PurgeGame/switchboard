@@ -2,6 +2,7 @@
 // Handles 0.160 (`event_msg/item_completed` with PascalCase items) and older
 // `user_message` / `agent_message` event_msgs.
 import type { SbEvent } from "../../shared/types.ts";
+import { toolDenialReason } from "./tool-denial.ts";
 
 export interface CodexParseResult {
   events: SbEvent[];
@@ -38,6 +39,21 @@ export function parseCodexLine(line: any, sessionId: string, offsetKey: string):
   const p = line?.payload ?? {};
 
   switch (line?.type) {
+    case "response_item": {
+      if (p.type === "function_call" || p.type === "custom_tool_call") {
+        let input: unknown = p.arguments ?? p.input;
+        if (p.type === "function_call" && typeof input === "string") {
+          try { input = JSON.parse(input); } catch { /* Keep the exact malformed input. */ }
+        }
+        const cwd = input && typeof input === "object" ? (input as any).workdir ?? (input as any).cwd : null;
+        push("", "tool_call", { name: p.name, toolUseId: p.call_id, input, cwd, summary: clip(typeof input === "string" ? input : JSON.stringify(input ?? {}), 300), paths: [] });
+      } else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
+        const output = typeof p.output === "string" ? p.output : itemText({ content: p.output });
+        const denialReason = toolDenialReason(output);
+        push("", "tool_result", { toolUseId: p.call_id, preview: clip(output, 600), isError: !!denialReason, ...(denialReason ? { denialReason } : {}) });
+      }
+      break;
+    }
     case "session_meta":
       if (p.cwd) patch.cwd = p.cwd;
       if (p.originator) patch.originator = p.originator;
@@ -97,12 +113,20 @@ export function parseCodexLine(line: any, sessionId: string, offsetKey: string):
               break;
             case "CommandExecution": {
               const cmd = Array.isArray(it.command) ? it.command.join(" ") : String(it.command ?? "");
-              push("", "tool_call", { name: "exec", summary: clip(cmd, 300), exitCode: it.exit_code ?? null, status: it.status ?? null, paths: [] });
+              push("", "tool_call", { name: "exec", toolUseId: it.id, input: { command: it.command, cwd: it.cwd }, cwd: it.cwd ?? null, summary: clip(cmd, 300), exitCode: it.exit_code ?? null, status: it.status ?? null, paths: [] });
+              if (it.status === "declined") {
+                const reason = it.aggregated_output || it.stderr || it.formatted_output || "Command rejected by the permission check.";
+                push("denied", "tool_result", { toolUseId: it.id, isError: true, preview: clip(reason, 600), denialReason: reason });
+              }
               break;
             }
             case "FileChange": {
               const paths = Object.keys(it.changes ?? {});
-              push("", "tool_call", { name: "apply_patch", summary: paths.join(", ").slice(0, 300), paths });
+              push("", "tool_call", { name: "apply_patch", toolUseId: it.id, input: it.changes, summary: paths.join(", ").slice(0, 300), paths });
+              if (it.status === "declined") {
+                const reason = it.error || "Patch rejected by the permission check.";
+                push("denied", "tool_result", { toolUseId: it.id, isError: true, preview: clip(reason, 600), denialReason: reason });
+              }
               break;
             }
             case "Extension":

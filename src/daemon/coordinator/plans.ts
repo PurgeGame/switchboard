@@ -2,10 +2,11 @@
 // each); the human's single approval grants the root, creates the tasks and lets the daemon launch
 // them as they become ready. This file holds the pure parts: validation and ordering.
 import { createHash } from "node:crypto";
-import type { Task, Tier } from "../../shared/types.ts";
+import type { Task, Tier, UsageSnapshot, WorkerRecommendation } from "../../shared/types.ts";
 import { pathScope, within } from "../grants.ts";
 import { overlaps } from "../coordination.ts";
 import type { CoordinatorConfig } from "./config.ts";
+import { recommendWorker } from "./recommendations.ts";
 import { modelFor, resolveTier } from "./tiers.ts";
 
 export const MAX_PLAN_TASKS = 8;
@@ -20,6 +21,7 @@ export interface PlanTask {
   /** Final tier (Settings rules win over the requested one). */
   tier: Tier;
   requestedTier: Tier;
+  recommendation?: WorkerRecommendation;
   tierReason: string;
   /** Set when a Settings rule replaced the coordinator's requested tier. */
   tierOverride: string | null;
@@ -97,7 +99,7 @@ export function planOrder(tasks: { key: string; prerequisites: string[] }[]): st
  * Validate and normalize a propose_plan call. `root` must already be the checked grant root
  * (the caller runs the same root checks as approve-to-grant). Throws with a message for the model.
  */
-export function validatePlan(a: any, root: string, cfg: CoordinatorConfig): PlanPayload {
+export function validatePlan(a: any, root: string, cfg: CoordinatorConfig, usage?: UsageSnapshot, now = Date.now()): PlanPayload {
   const title = typeof a.title === "string" ? a.title.trim() : "";
   if (!title) throw Error("a plan needs a title");
   if (a.resources !== undefined && !Array.isArray(a.resources)) throw Error("resources must be a list");
@@ -119,8 +121,8 @@ export function validatePlan(a: any, root: string, cfg: CoordinatorConfig): Plan
     if (!acceptance.length) throw Error(`${where}: at least one acceptance criterion`);
     if (t.prerequisites !== undefined && !Array.isArray(t.prerequisites)) throw Error(`${where}: prerequisites must be a list of keys`);
     const prerequisites = [...new Set(((t.prerequisites ?? []) as unknown[]).map(String))];
-    if (t.provider !== "claude" && t.provider !== "codex") throw Error(`${where}: provider must be claude or codex`);
-    if (!["light", "standard", "deep"].includes(t.tier)) throw Error(`${where}: tier must be light, standard or deep`);
+    if (t.provider !== undefined && t.provider !== "claude" && t.provider !== "codex") throw Error(`${where}: provider must be claude or codex`);
+    if (t.tier !== undefined && !["light", "standard", "deep"].includes(t.tier)) throw Error(`${where}: tier must be light, standard or deep`);
     if (t.paths !== undefined && !Array.isArray(t.paths)) throw Error(`${where}: paths must be a list`);
     const paths = ((t.paths ?? []) as unknown[]).length
       ? [
@@ -140,18 +142,20 @@ export function validatePlan(a: any, root: string, cfg: CoordinatorConfig): Plan
     } catch (e) {
       throw Error(`${where}: ${(e as Error).message}`);
     }
-    const tierOverride = r.source === "rule" && r.tier !== requestedTier ? `asked for ${requestedTier}; ${r.reason}` : null;
+    const tierOverride = requestedTier && r.source === "rule" && r.tier !== requestedTier ? `asked for ${requestedTier}; ${r.reason}` : null;
     const why = typeof t.tierReason === "string" && t.tierReason.trim() ? t.tierReason.trim() : "";
-    const m = modelFor(cfg, r.tier, t.provider);
+    const recommendation = recommendWorker({ title: tTitle, description: `${brief}\n${acceptance.join("\n")}`, paths, provider: t.provider, tier: t.tier, tierReason: t.tierReason }, cfg, usage, now);
+    const m = recommendation;
     return {
       key,
       title: tTitle.slice(0, 200),
       brief,
       acceptance,
       prerequisites,
-      provider: t.provider,
-      tier: r.tier,
-      requestedTier,
+      provider: recommendation.provider,
+      tier: recommendation.tier,
+      requestedTier: requestedTier ?? r.tier,
+      recommendation,
       tierReason: r.overridden || r.source === "rule" ? r.reason : why ? `${r.reason}. ${why}` : r.reason,
       tierOverride,
       paths,
@@ -214,7 +218,10 @@ export function planDrift(pl: PlanPayload, cfg: CoordinatorConfig): string[] {
   const out: string[] = [];
   for (const t of pl.tasks) {
     try {
-      const r = resolveTier({ title: t.title, description: t.brief, paths: t.paths }, cfg.tierRules, { tier: t.requestedTier, reason: t.tierReason });
+      const r = t.recommendation
+        ? recommendWorker({ title: t.title, description: `${t.brief}\n${t.acceptance.join("\n")}`, paths: t.paths, provider: t.provider, tier: t.tier, tierReason: t.tierReason },
+            { ...cfg, usageRecommendations: { ...cfg.usageRecommendations, enabled: false } })
+        : resolveTier({ title: t.title, description: t.brief, paths: t.paths }, cfg.tierRules, { tier: t.requestedTier, reason: t.tierReason });
       const m = modelFor(cfg, r.tier, t.provider);
       if (r.tier !== t.tier || m.model !== t.model || (m.effort ?? null) !== (t.effort ?? null))
         out.push(`${t.key}: now ${r.tier} ${m.model}${m.effort ? ` ${m.effort}` : ""} (shown ${t.tier} ${t.model}${t.effort ? ` ${t.effort}` : ""})`);

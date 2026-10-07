@@ -242,7 +242,7 @@ test("Settings tier rules override the requested tier, and the override is recor
   expect(docs.tier).toBe("light");
   expect(docs.requestedTier).toBe("deep");
   expect(docs.tierOverride).toMatch(/asked for deep/);
-  expect(docs.model).toBe("haiku");
+  expect(docs.model).toBe("haiku"); // the default light tier
   expect(r.result.tierOverrides[0]).toMatch(/^docs:/);
   await x.agent.approve(r.result.proposal.id, { digest: r.result.proposal.digest });
   await x.agent.settled();
@@ -262,16 +262,16 @@ test("a dependent on the same files launches once its prerequisite is verified (
   expect(x.c.claims().some((c) => c.taskId === impl.id)).toBe(false);
 });
 
-test("a task whose scope someone else holds waits without counting as a failed launch", async () => {
+test("a plan task isn't held up by a claim on the shared tree: it works in its own worktree and claims its files there", async () => {
   const x = fixture();
   x.sessions.set("human1", { ...require("../src/daemon/state.ts").blankSession("human1", "claude", "tui", "human1"), cwd: x.root, execution: "idle" });
   x.c.claim("human1", `path:${x.root}/src/a.ts`);
   await proposeAndApprove(x, [task("a")]);
-  expect(x.launches.length).toBe(0);
+  expect(x.launches.length).toBe(1);
   const a = x.agent.plansSnapshot()[0].tasks[0];
-  expect(a.state).toBe("waiting");
-  expect(a.attempts).toBe(0);
-  expect(a.error).toMatch(/held by human1/);
+  expect(a).toMatchObject({ state: "launched", attempts: 0 });
+  const mine = x.c.claims().filter((c) => c.owner === a.sessionId);
+  expect(mine.map((c) => c.resource)).toEqual([`path:${x.launches[0].cwd}/src/a.ts`]);
 });
 
 test("worktree names fit the strict slug rule for real task ids and any title (found by the live run)", async () => {
@@ -358,21 +358,34 @@ test("no tasks can be added to a plan's objective, and plan tasks launch only th
   expect(x.launches.length).toBe(1);
 });
 
-test("prerequisite claim release frees only the prerequisite worker's claims inside the dependent's scope", async () => {
+test("a verified prerequisite releases all its claims (D36), so the dependent launches; leftover claims still get only the narrow D32 release", async () => {
   const x = fixture();
   await proposeAndApprove(x, [task("impl", { paths: ["src/impl"] }), task("review", { paths: ["src/impl/a.ts", "src/other.ts"], prerequisites: ["impl"] })]);
   const impl = tasksByTitle(x).get("Do impl")!;
+  const review = tasksByTitle(x).get("Do review")!;
   // impl's worker claims all of src/impl (wider than review's src/impl/a.ts); someone else holds a claim tagged with impl.
   x.sessions.set("human1", { ...blankSession("human1", "claude", "tui", "human1"), cwd: x.root, execution: "idle" });
-  const other = x.c.claim("human1", `path:${x.root}/src/other.ts`, { taskId: impl.id, exclusive: true } as any);
-  expect(x.c.claims(["active"]).some((c) => c.owner === "human1")).toBe(true);
+  x.c.claim("human1", `path:${x.root}/src/other.ts`, { taskId: impl.id, exclusive: true } as any);
+  expect(x.c.claims(["active"]).filter((c) => c.taskId === impl.id)).toHaveLength(2);
   for (const criterion of impl.acceptance) x.c.recordEvidence(impl.id, "human", "checked", { criterion });
   await x.agent.settled();
-  const active = x.c.claims(["active", "suspect"]);
-  expect(active.some((c) => c.owner === "human1")).toBe(true); // not ours to release
-  expect(active.some((c) => c.owner === "worker0" && c.taskId === impl.id)).toBe(true); // wider than review's scope: kept
-  expect(x.launches.length).toBe(1); // review waits on the held claim
-  expect(other).toBeTruthy();
+  expect(x.c.claims(["active", "suspect", "waiting"]).filter((c) => c.taskId === impl.id)).toHaveLength(0);
+  expect(x.launches.length).toBe(2); // review launched
+  expect(review.prerequisites).toEqual([impl.id]);
+  // Claims left on an already-verified prerequisite (from before D36): only the prerequisite
+  // worker's claims inside the dependent's scope are released, never wider ones or someone else's.
+  const o = x.c.createObjective("Legacy", "", undefined, "human");
+  x.c.grantObjective(o.id, { root: x.root, resources: [] }, "human");
+  const lib = x.c.createTask({ title: "lib", objectiveId: o.id, acceptance: ["ok"], scope: { paths: [`${x.root}/src/lib`], resources: [] } }, "human");
+  const dep = x.c.createTask({ title: "dep", objectiveId: o.id, acceptance: ["ok"], prerequisites: [lib.id], scope: { paths: [`${x.root}/src/lib/a.ts`, `${x.root}/src/third.ts`], resources: [] } }, "human");
+  x.c.recordEvidence(lib.id, "human", "checked", { criterion: "ok" });
+  const inside = x.c.claim("worker9", `path:${x.root}/src/lib/a.ts`, { taskId: lib.id } as any).claim;
+  const wider = x.c.claim("worker9", `path:${x.root}/src/lib`, { taskId: lib.id, exclusive: false } as any).claim;
+  const theirs = x.c.claim("human1", `path:${x.root}/src/third.ts`, { taskId: lib.id, exclusive: false } as any).claim;
+  expect(x.c.releaseVerifiedPrerequisiteClaims(dep, new Map([[lib.id, "worker9"]]))).toEqual([inside.id]);
+  const active = x.c.claims(["active", "suspect"]).map((c) => c.id);
+  expect(active).toContain(wider.id);
+  expect(active).toContain(theirs.id);
 });
 
 test("state() exposes plan tasks, so the UI can offer Retry on a failed one; only a failed task retries", async () => {

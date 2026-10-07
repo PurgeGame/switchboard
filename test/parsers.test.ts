@@ -32,6 +32,11 @@ describe("claude transcript parser", () => {
     expect(r.events[0].data).toMatchObject({ text: "hello", from: "other-1" });
   });
 
+  test("a subagent's brief (sidechain) is not a user message", () => {
+    const r = parseClaudeRecord({ type: "user", uuid: "u9", isSidechain: true, timestamp: "2026-10-06T16:00:00Z", message: { role: "user", content: "Search the repo for X" } }, "s", "@0");
+    expect(r.events).toEqual([]);
+  });
+
   test("interrupt, api error, soft turn end, rename", () => {
     expect(parseClaudeRecord({ type: "user", uuid: "a", message: { content: [{ type: "text", text: "[Request interrupted by user]" }] } }, "s", "x").events[0].type).toBe("interrupted");
     const err = parseClaudeRecord({ type: "assistant", uuid: "b", isApiErrorMessage: true, apiErrorStatus: 429, error: "rate_limit", message: { model: "<synthetic>", content: [{ type: "text", text: "limit" }] } }, "s", "x");
@@ -53,7 +58,7 @@ describe("codex rollout parser", () => {
   const events = recs.flatMap((r, i) => parseCodexLine(r, "s", `@${i}`).events);
 
   test("fixture: full turn lifecycle", () => {
-    expect(events.map((e) => e.type)).toEqual(["session_started", "turn_started", "user_msg", "assistant_msg", "tool_call", "assistant_msg", "turn_ended"]);
+    expect(events.map((e) => e.type)).toEqual(["session_started", "turn_started", "user_msg", "assistant_msg", "tool_call", "tool_call", "tool_result", "tool_call", "tool_result", "assistant_msg", "turn_ended"]);
     const end = events.at(-1)!;
     expect(end.data.lastAgentMessage).toContain("codex spike 1");
     expect(typeof end.data.durationMs).toBe("number");

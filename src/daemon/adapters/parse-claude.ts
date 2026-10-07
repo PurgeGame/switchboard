@@ -1,5 +1,6 @@
 // Claude Code transcript record -> normalized events. Pure; tested against fixtures.
 import type { SbEvent } from "../../shared/types.ts";
+import { toolDenialReason } from "./tool-denial.ts";
 
 export interface ParseResult {
   events: SbEvent[];
@@ -28,6 +29,8 @@ export function toolSummary(name: string, input: any): { summary: string; paths:
   for (const k of ["file_path", "notebook_path", "path"]) if (typeof input?.[k] === "string") paths.push(input[k]);
   let summary = "";
   if (name === "Bash") summary = String(input?.command ?? "");
+  else if (name === "AskUserQuestion" && Array.isArray(input?.questions))
+    summary = input.questions.map((q: any) => (typeof q?.question === "string" ? q.question : "")).filter(Boolean).join("\n");
   else if (paths.length) summary = paths[0];
   else if (typeof input?.pattern === "string") summary = input.pattern;
   else if (typeof input?.description === "string") summary = input.description;
@@ -52,7 +55,8 @@ export function parseClaudeRecord(r: any, sessionId: string, offsetKey: string):
         content.forEach((b: any, i: number) => {
           if (b?.type !== "tool_result") return;
           const preview = typeof b.content === "string" ? b.content : textOf(b.content);
-          push(`r${i}`, "tool_result", { toolUseId: b.tool_use_id, isError: !!b.is_error, preview: clip(preview, 600) });
+          const denialReason = b.is_error ? toolDenialReason(preview) : null;
+          push(`r${i}`, "tool_result", { toolUseId: b.tool_use_id, isError: !!b.is_error, preview: clip(preview, 600), ...(denialReason ? { denialReason } : {}) });
         });
         break;
       }
@@ -79,6 +83,8 @@ export function parseClaudeRecord(r: any, sessionId: string, offsetKey: string):
       } else if (kind === "auto-continuation") {
         push("", "auto_msg", { text: clip(text) });
         push("turn", "turn_started", { origin: "auto" });
+      } else if (r.isSidechain) {
+        // A subagent's brief is stored as a user message, but no human typed it.
       } else if ((kind === "human" || (!r.isMeta && kind === undefined && text)) && !SYSTEM_DELIVERY.test(text)) {
         push("", "user_msg", { text: clip(text) });
         push("turn", "turn_started", { origin: "human" });
@@ -102,7 +108,7 @@ export function parseClaudeRecord(r: any, sessionId: string, offsetKey: string):
         if (b?.type === "text" && b.text) push(`b${i}`, "assistant_msg", { text: clip(b.text), messageId: m.id ?? null });
         else if (b?.type === "tool_use") {
           const { summary, paths } = toolSummary(b.name, b.input);
-          push(`b${i}`, "tool_call", { name: b.name, toolUseId: b.id, summary, paths });
+          push(`b${i}`, "tool_call", { name: b.name, toolUseId: b.id, summary, paths, input: b.input, cwd: r.cwd ?? null });
         }
       });
       if (m.stop_reason === "end_turn") patch.softTurnEnd = true;

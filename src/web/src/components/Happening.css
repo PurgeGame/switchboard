@@ -1,0 +1,84 @@
+/* Scoped to the coordinator's work panel; theme tokens match the usage chip. */
+.happening { color: var(--color-ink); font-size: 13px; }
+.happening h2 { font-size: 15px; font-weight: 650; }
+.happening-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.happening button, .happening summary { cursor: pointer; }
+.happening button:disabled { cursor: wait; opacity: .55; }
+.happening-running { --work-tone: var(--color-focus); color: var(--work-tone); }
+.happening-needs { --work-tone: var(--color-amber); color: var(--work-tone); }
+.happening-waiting, .happening-idle, .happening-queued, .happening-stopped { --work-tone: var(--color-ink-2); color: var(--work-tone); }
+.happening-failed { --work-tone: var(--color-red); color: var(--work-tone); }
+.happening-done { --work-tone: var(--color-green); color: var(--work-tone); }
+.happening-legend { position: relative; }
+.happening-legend summary { display: grid; place-items: center; height: 44px; width: 44px; color: var(--color-ink-2); list-style: none; border-radius: 6px; }
+.happening-legend summary:hover { background: var(--color-hover); }
+.happening-expanded { transform: rotate(90deg); }
+.happening-legend ul { position: absolute; top: 44px; right: 0; z-index: 20; display: grid; gap: 10px; width: 220px; padding: 12px; font-size: 12px; border: 1px solid var(--color-line-strong); border-radius: 8px; background: var(--color-panel); box-shadow: 0 8px 24px #0006; }
+.happening-legend li { display: flex; gap: 7px; align-items: center; }
+.happening-legend li > :first-child { flex: 0 0 16px; }
+.happening-legend li > .happening-dot { flex-basis: 10px; margin-inline: 3px; }
+.happening-legend li span:last-child { color: var(--color-ink-2); }
+.happening-summary { display: flex; align-items: center; gap: 8px; color: var(--color-ink-2); white-space: nowrap; }
+.happening-summary:empty { display: none; }
+.happening-summary button { min-height: 44px; padding: 0 5px; border-radius: 6px; font-size: 12px; }
+.happening-summary strong { font-weight: 650; }
+.happening-summary button:hover, .happening-review:hover, .happening-show-finished:hover, .happening-disclosure:hover { background: var(--color-hover); }
+.happening-group { margin-top: 10px; scroll-margin-top: 16px; }
+.happening-group h3 { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; font-size: 12px; font-weight: 600; }
+.happening-group h3 span { font-size: 11px; border-radius: 5px; padding: 1px 6px; background: var(--color-raised); }
+.happening-cards { display: grid; gap: 6px; }
+.happening-card { min-width: 0; border: 1px solid var(--color-line-strong); border-radius: 12px; background: var(--color-raised); }
+.happening-card-heading { display: flex; align-items: flex-start; gap: 2px; padding: 2px 4px 0 6px; }
+.happening-card h4 { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; line-height: 19px; }
+.happening-objective-toggle { display: flex; align-items: flex-start; gap: 6px; width: 100%; min-height: 44px; padding: 6px 2px; border-radius: 6px; text-align: left; }
+.happening-objective-toggle > svg { flex: 0 0 12px; margin-top: 3px; }
+.happening-objective-toggle:hover { background: var(--color-hover); }
+.happening-heading-text { flex: 1; min-width: 0; }
+.happening-task-counts { display: block; margin-top: 2px; color: var(--color-ink-2); font-size: 12px; font-weight: 400; line-height: 17px; overflow-wrap: anywhere; }
+.happening-details-open .happening-title { display: block; -webkit-line-clamp: unset; overflow: visible; }
+.happening button:focus-visible, .happening summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+.happening-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; min-width: 0; }
+.happening-actions { position: relative; flex-shrink: 0; }
+.happening-actions summary { display: grid; place-items: center; list-style: none; width: 44px; height: 44px; border-radius: 8px; color: var(--color-ink-2); font-size: 23px; }
+.happening-actions summary:hover, .happening-actions[open] summary { background: var(--color-hover); }
+.happening summary::-webkit-details-marker { display: none; }
+.happening-menu { position: absolute; top: 44px; right: 0; z-index: 10; padding: 4px; width: 180px; border: 1px solid var(--color-line-strong); border-radius: 8px; background: var(--color-panel); box-shadow: 0 8px 24px #0006; }
+.happening-menu button { min-height: 44px; width: 100%; padding: 8px 12px; text-align: left; border-radius: 5px; color: var(--color-red); }
+.happening-menu button:hover { background: var(--color-hover); }
+.happening-progress { display: flex; gap: 3px; height: 3px; margin: 0 10px 5px; }
+.happening-segment { flex: 1; min-width: 0; border-radius: 3px; background: var(--work-tone); }
+.happening-segment.happening-queued { background: transparent; border: 1px solid var(--color-ink-3); }
+.happening-segment.happening-waiting, .happening-segment.happening-stopped { opacity: .5; }
+.happening-tasks { padding: 0 4px 2px; }
+.happening-task { display: flex; align-items: flex-start; }
+.happening-task + .happening-task { border-top: 1px solid var(--color-line); }
+.happening-task-content { display: flex; flex: 1; min-width: 0; min-height: 44px; flex-direction: column; gap: 2px; padding: 6px 6px 6px 0; text-align: left; color: var(--color-ink); font-size: 13px; line-height: 19px; border-radius: 6px; }
+.happening-task-details { flex-basis: 100%; min-width: 0; padding: 0 8px 8px 12px; color: var(--color-ink-2); font-size: 12px; line-height: 18px; overflow-wrap: anywhere; }
+.happening-task-details > * + * { margin-top: 4px; }
+.happening-task-lifecycle { color: var(--color-ink-2); }
+.happening-task-text { white-space: pre-wrap; color: var(--color-ink); }
+.happening-owner { min-height: 44px; min-width: 44px; text-align: left; color: var(--color-focus); border-radius: 6px; }
+.happening-owner:hover { background: var(--color-hover); }
+.happening-dependencies { list-style: disc; padding-left: 16px; }
+.happening-task-details summary { display: flex; align-items: center; min-height: 44px; }
+.happening-task-details .happening-review { margin: 0; }
+button.happening-task-content:hover { background: var(--color-hover); }
+.happening-status { position: relative; flex: 0 0 44px; }
+.happening-status-button { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 8px; }
+.happening-status-button:hover { background: var(--color-hover); }
+.happening-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid currentColor; }
+.happening-running .happening-dot { background: currentColor; }
+.happening-tooltip { position: absolute; left: 4px; top: 42px; z-index: 20; width: max-content; max-width: 230px; padding: 8px 12px; border: 1px solid var(--color-line-strong); border-radius: 8px; background: var(--color-panel); color: var(--color-ink); font-size: 12px; box-shadow: 0 6px 20px #0006; }
+.happening-worker { display: flex; align-items: center; gap: 6px; color: var(--color-ink-2); font-size: 11px; font-variant-numeric: tabular-nums; }
+.happening-worker [role=img] { display: flex; }
+.happening-empty, .happening-empty-card, .happening-outcome { color: var(--color-ink-2); font-size: 12px; }
+.happening-empty-card, .happening-outcome { padding: 4px 12px 8px; }
+.happening-finished { background: var(--color-panel); }
+.happening-review, .happening-show-finished { min-height: 44px; padding: 0 8px; display: flex; align-items: center; gap: 6px; color: var(--color-ink-2); font-size: 12px; border-radius: 6px; }
+.happening-review { margin: 4px 0 -8px; color: var(--color-amber); }
+.happening-disclosure { display: flex; align-items: center; gap: 8px; min-height: 44px; width: 100%; padding: 0 8px; color: var(--color-ink-2); border-radius: 6px; text-align: left; }
+.happening-disclosure span { margin-left: auto; }
+.happening-error { padding: 4px 12px 12px; color: var(--color-red); overflow-wrap: anywhere; }
+@keyframes happening-pulse { 50% { opacity: .45; box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-focus) 15%, transparent); } }
+.happening-pulse { animation: happening-pulse 1.8s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .happening-pulse { animation: none; } }

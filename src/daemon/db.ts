@@ -129,6 +129,12 @@ export class Store {
     return rows.reverse().map((r) => ({ id: r.id, sessionId: r.session_id, sourceId: r.source_id, type: r.type, ts: r.ts, data: JSON.parse(r.data) }));
   }
 
+  /** Match a result to its original, unabridged call, including across daemon restarts. */
+  toolCall(sessionId: string, toolUseId: string): Record<string, unknown> | null {
+    const row = this.db.query("SELECT data FROM events WHERE session_id = ? AND type = 'tool_call' AND json_extract(data, '$.toolUseId') = ? ORDER BY id DESC LIMIT 1").get(sessionId, toolUseId) as { data: string } | null;
+    return row ? JSON.parse(row.data) : null;
+  }
+
   // ---- attention
   /** Insert unless (session, kind, sourceKey) exists. Returns the stored item or null if duplicate. */
   insertAttention(item: Omit<AttentionItem, "id">): AttentionItem | null {

@@ -22,6 +22,14 @@ export const paths = {
 };
 
 export interface Config {
+  /**
+   * Safe permission auto-approval (D44). false (default): off until switched on in Settings.
+   * true: reviewed read-only calls for any session not excluded from coordination; reviewed
+   * verification commands, which run project code, only for coordinator workers inside their own
+   * Switchboard worktree. "all": verification commands for every session not excluded.
+   * The Settings switch turns it on or off; its scope comes only from here.
+   */
+  autoApproveSafePermissions?: AutoApproveSetting;
   /** Minutes a permission prompt waits for you in Switchboard before the terminal asks instead. */
   permissionHoldMinutes?: number;
   port: number;
@@ -39,7 +47,16 @@ export interface Config {
   autoContinue: { enabled: boolean; graceMs: number; maxConsecutive: number; typingHoldMs: number; offProjects: string[] };
   /** Name other devices reach this daemon by through `tailscale serve`. Unset: this machine's tailnet name; null: loopback only. */
   remoteHost?: string | null;
+  /** Read Claude usage through the CLI's own usage endpoint with your Claude login token (undocumented; off by default, set true to turn on). Codex usage needs no setting. */
+  usage?: { claudeOAuth?: boolean };
+  /**
+   * Phone notifications. details: put the item's text (commands, paths) in the notification
+   * body; by default it says only how many items need you. subject: the VAPID contact.
+   */
+  push?: { details?: boolean; subject?: string };
 }
+
+export type AutoApproveSetting = boolean | "all";
 
 const defaults: Config = {
   port: 7777,
@@ -51,7 +68,21 @@ const defaults: Config = {
   notifyIgnore: ["/.sandbox/", "/.sandbox"],
   modelClassifier: true,
   autoContinue: { enabled: true, graceMs: 10_000, maxConsecutive: 3, typingHoldMs: 120_000, offProjects: [] },
+  autoApproveSafePermissions: false,
+  usage: { claudeOAuth: false },
+  push: { details: false, subject: "mailto:switchboard@localhost" },
 };
+
+/** config.json over the defaults (pure: no files, environment or Tailscale lookup). */
+export function mergeConfig(user: Partial<Config> = {}): Config {
+  const cfg: Config = { ...defaults, ...user, autoContinue: { ...defaults.autoContinue, ...(user.autoContinue ?? {}) }, usage: { ...defaults.usage, ...(user.usage ?? {}) }, push: { ...defaults.push, ...(user.push ?? {}) } };
+  const auto = cfg.autoApproveSafePermissions;
+  if (auto !== true && auto !== false && auto !== "all") {
+    console.error(`[config] autoApproveSafePermissions must be false, true or "all"; using false`);
+    cfg.autoApproveSafePermissions = false;
+  }
+  return cfg;
+}
 
 /** Transcripts and tokens live here: owner-only directories and files. */
 export function secureDirs() {
@@ -74,7 +105,7 @@ export function loadConfig(): Config {
   const f = join(paths.configDir, "config.json");
   let user: Partial<Config> = {};
   if (existsSync(f)) user = JSON.parse(readFileSync(f, "utf8"));
-  const cfg = { ...defaults, ...user, autoContinue: { ...defaults.autoContinue, ...(user.autoContinue ?? {}) } };
+  const cfg = mergeConfig(user);
   if (process.env.SB_PORT) cfg.port = Number(process.env.SB_PORT);
   if (cfg.remoteHost === undefined) cfg.remoteHost = tailnetName();
   return cfg;

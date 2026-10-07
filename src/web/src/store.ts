@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from "react";
-import type { CoordinatorAgentKind, CoordinatorState, AttentionItem, Claim, Conflict, Objective, OutboxMessage, PerspectiveGroup, SbEvent, ServerPush, Session, SystemStats, Task } from "../../shared/types.ts";
-import { ackAttention as postAck, fetchAllAttention, fetchCoordination, fetchCoordinator, fetchEvents, fetchGovernor, type GovernorSnapshot, fetchOutbox, fetchSessions, wsUrl } from "./api.ts";
-import type { StatusGroup } from "./status.ts";
+import type { CoordinatorAgentKind, CoordinatorState, AttentionItem, Claim, Conflict, Objective, OutboxMessage, PerspectiveGroup, SbEvent, ServerPush, Session, SystemStats, Task, UsageSnapshot } from "../../shared/types.ts";
+import { ackAttention as postAck, fetchAllAttention, fetchCoordination, fetchCoordinator, fetchEvents, fetchGovernor, fetchUsage, type GovernorSnapshot, fetchOutbox, fetchSessions, wsUrl } from "./api.ts";
+import { projectOf, rememberTasks, type StatusGroup } from "./status.ts";
+import { restorePhoneNotifications } from "./push.ts";
 import { parseDeepLink, writeDeepLink } from "./deeplink.ts";
 
 /** workspace: the session list and one chat (the coordinator is the first entry). perspectives: compare answers. */
@@ -10,7 +11,7 @@ export type View = "workspace";
 export const COORDINATOR_ID = "coordinator";
 export type ConnState = "connecting" | "open" | "closed";
 export type ProviderFilter = "all" | "claude" | "codex" | "other";
-export type GroupFilter = "all" | StatusGroup;
+export type GroupFilter = "all" | "unread" | StatusGroup;
 
 export interface Transcript {
   events: SbEvent[];
@@ -57,6 +58,7 @@ export interface State {
   /** Which coordinator the daemon runs (D34); null until its first message. "none": no coordinator anywhere. */
   coordinatorAgent: CoordinatorAgentKind | null;
   governor: GovernorSnapshot | null;
+  usage: UsageSnapshot | null;
   selectedTaskId: string | null;
   /** Group open in the Perspectives view; null shows the "Ask several" form. */
   selectedGroupId: string | null;
@@ -72,12 +74,18 @@ export interface State {
   prefs: Prefs;
   /** Last event id the user has seen per session; persisted. */
   lastSeen: Record<string, number>;
+  /** Latest assistant message or turn end observed, including output found after reconnect. */
+  lastAssistantEvent: Record<string, number>;
   search: string;
   providerFilter: ProviderFilter;
   groupFilter: GroupFilter;
   endedOpen: boolean;
   /** Background agents section expanded; persisted. */
   backgroundOpen: boolean;
+  /** Background sessions pinned into the main list, remembered in this browser. */
+  mainSessionIds: string[];
+  /** Folder groups you collapsed in the session list (their keys), remembered in this browser. */
+  collapsedFolders: string[];
   /** Work-context drawer, used below the xl breakpoint where it is not a fixed pane. */
   contextOpen: boolean;
 }
@@ -86,6 +94,17 @@ const PAGE = 200;
 const SEEN_KEY = "switchboard.lastSeen";
 const PREFS_KEY = "switchboard.prefs";
 const BACKGROUND_KEY = "switchboard.backgroundOpen";
+const COLLAPSED_KEY = "switchboard.collapsedFolders";
+const MAIN_SESSIONS_KEY = "switchboard.mainSessionIds";
+
+function loadIds(key: string): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) ?? "[]");
+    return Array.isArray(v) ? v.filter((k): k is string => typeof k === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
 function loadBackgroundOpen(): boolean {
   try {
@@ -137,6 +156,7 @@ let state: State = {
   coordinatorAgent: null,
   selectedTaskId: null,
   governor: null,
+  usage: null,
   selectedGroupId: null,
   autoPending: {},
   autoNotes: {},
@@ -146,17 +166,21 @@ let state: State = {
   inboxSelectedId: null,
   prefs: loadPrefs(),
   lastSeen: loadSeen(),
+  lastAssistantEvent: {},
   search: "",
   providerFilter: "all",
   groupFilter: "all",
   endedOpen: false,
   backgroundOpen: loadBackgroundOpen(),
+  mainSessionIds: loadIds(MAIN_SESSIONS_KEY),
+  collapsedFolders: loadIds(COLLAPSED_KEY),
   contextOpen: false,
 };
 
 const listeners = new Set<() => void>();
 
 function set(patch: Partial<State>) {
+  if (patch.coordination) rememberTasks(patch.coordination.tasks); // before anything renders a worker's title
   state = { ...state, ...patch };
   listeners.forEach((l) => l());
 }
@@ -209,6 +233,30 @@ export function toggleBackground() {
   }
   set({ backgroundOpen });
 }
+export function toggleFolder(key: string) {
+  const collapsedFolders = state.collapsedFolders.includes(key) ? state.collapsedFolders.filter((k) => k !== key) : [...state.collapsedFolders, key];
+  try {
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify(collapsedFolders));
+  } catch {
+    // Then it's remembered for this page only.
+  }
+  set({ collapsedFolders });
+}
+
+export function toggleMainSession(id: string) {
+  const pinned = state.mainSessionIds.includes(id);
+  const mainSessionIds = pinned ? state.mainSessionIds.filter((s) => s !== id) : [...state.mainSessionIds, id];
+  try {
+    localStorage.setItem(MAIN_SESSIONS_KEY, JSON.stringify(mainSessionIds));
+  } catch {
+    // Preferences then last for this page only.
+  }
+  // Keep the row visible in its destination, even if that section was collapsed.
+  if (pinned && !state.backgroundOpen) toggleBackground();
+  const session = state.sessions[id];
+  if (!pinned && session && state.collapsedFolders.includes(projectOf(session))) toggleFolder(projectOf(session));
+  set({ mainSessionIds });
+}
 export const setContextOpen = (contextOpen: boolean) => set({ contextOpen });
 export const showList = () => set({ mobilePane: "list" });
 
@@ -227,7 +275,7 @@ function patchTranscript(id: string, patch: Partial<Transcript>) {
 }
 
 function markSeen(id: string) {
-  const ids = [state.sessions[id]?.lastEventId ?? 0, ...(state.transcripts[id]?.events.map((e) => e.id ?? 0) ?? [])];
+  const ids = [state.sessions[id]?.lastEventId ?? 0, state.lastAssistantEvent[id] ?? 0, ...(state.transcripts[id]?.events.map((e) => e.id ?? 0) ?? [])];
   const top = Math.max(...ids);
   if (top <= (state.lastSeen[id] ?? 0)) return;
   const lastSeen = { ...state.lastSeen, [id]: top };
@@ -235,10 +283,44 @@ function markSeen(id: string) {
   set({ lastSeen });
 }
 
+function viewingSession(id: string): boolean {
+  return state.selectedId === id && !document.hidden && (state.mobilePane === "detail" || window.matchMedia("(min-width: 1024px)").matches);
+}
+
+function rememberAssistantEvents(events: SbEvent[]) {
+  const lastAssistantEvent = { ...state.lastAssistantEvent };
+  let changed = false;
+  for (const e of events) {
+    if ((e.type === "assistant_msg" || e.type === "turn_ended") && (e.id ?? 0) > (lastAssistantEvent[e.sessionId] ?? 0)) {
+      lastAssistantEvent[e.sessionId] = e.id!;
+      changed = true;
+    }
+  }
+  if (changed) set({ lastAssistantEvent });
+}
+
+/** Check output missed while disconnected, without loading every session's transcript into the UI. */
+async function refreshUnread(s: Session) {
+  if ((s.lastEventId ?? 0) <= (state.lastSeen[s.id] ?? 0)) return;
+  let before: number | undefined;
+  try {
+    while ((state.lastAssistantEvent[s.id] ?? 0) <= (state.lastSeen[s.id] ?? 0)) {
+      const events = await fetchEvents(s.id, { limit: PAGE, before });
+      rememberAssistantEvents(events);
+      const oldest = events[0]?.id;
+      if (events.length < PAGE || oldest === undefined || oldest <= (state.lastSeen[s.id] ?? 0)) break;
+      before = oldest;
+    }
+  } catch {
+    // Live events or the next reconnect can retry unread discovery.
+  }
+}
+
 export async function loadLatest(id: string) {
   patchTranscript(id, { loading: true, error: null });
   try {
     const fetched = await fetchEvents(id, { limit: PAGE });
+    rememberAssistantEvents(fetched);
     const prev = state.transcripts[id];
     patchTranscript(id, {
       events: mergeEvents(prev?.events ?? [], fetched),
@@ -248,7 +330,7 @@ export async function loadLatest(id: string) {
   } catch (err) {
     patchTranscript(id, { loading: false, error: (err as Error).message });
   }
-  if (state.selectedId === id) markSeen(id);
+  if (viewingSession(id)) markSeen(id);
 }
 
 export async function loadOlder(id: string) {
@@ -272,19 +354,15 @@ export function selectSession(id: string | null, openDetail = false) {
   set({ selectedId: id, mobilePane: openDetail ? "detail" : state.mobilePane });
   writeDeepLink(id === COORDINATOR_ID ? null : id);
   if (!id || id === COORDINATOR_ID) return;
+  if (viewingSession(id)) markSeen(id);
   void loadOutbox(id);
   if (!state.transcripts[id]) void loadLatest(id);
-  else markSeen(id);
 }
 
 /** Opens a session in the workspace from anywhere (inbox, wall, notification, deep link). */
 export function openSession(id: string) {
   set({ view: "workspace", inboxOpen: false });
   selectSession(id, true);
-}
-
-export function isUnread(lastSeen: Record<string, number>, s: Session): boolean {
-  return s.lastEventId !== null && s.lastEventId > (lastSeen[s.id] ?? 0);
 }
 
 // ---- outbox ---------------------------------------------------------------
@@ -385,8 +463,8 @@ function baselineSeen(sessions: Session[]): Record<string, number> {
   const lastSeen = { ...state.lastSeen };
   let changed = false;
   for (const s of sessions) {
-    if (lastSeen[s.id] === undefined && s.lastEventId !== null) {
-      lastSeen[s.id] = s.lastEventId;
+    if (lastSeen[s.id] === undefined) {
+      lastSeen[s.id] = s.lastEventId ?? 0;
       changed = true;
     }
   }
@@ -437,8 +515,15 @@ function applyPush(msg: ServerPush) {
       const sessions: Record<string, Session> = {};
       for (const s of msg.sessions) sessions[s.id] = s;
       set({ sessions, system: msg.system ?? state.system, lastSeen: baselineSeen(msg.sessions) });
-      if (msg.attention) upsertAttention(msg.attention);
+      for (const s of msg.sessions) void refreshUnread(s);
+      // Reconnect replaces the open set so items resolved while disconnected disappear.
+      if (msg.attention) {
+        const resolved = Object.fromEntries(Object.entries(state.attention).filter(([, i]) => i.status === "resolved"));
+        set({ attention: { ...resolved, ...Object.fromEntries(msg.attention.map((i) => [i.id, i])) } });
+      }
+      void restorePhoneNotifications();
       refreshGovernor();
+      void fetchUsage().then((usage) => set({ usage })).catch(() => undefined);
       void fetchCoordination().then((coordination) => set({ coordination })).catch(() => undefined);
       // A daemon from before D34 doesn't say: it always had the built-in coordinator.
       const coordinatorAgent = msg.coordinatorAgent ?? "builtin";
@@ -478,7 +563,7 @@ function applyPush(msg: ServerPush) {
       break;
     case "session":
       set({ sessions: { ...state.sessions, [msg.session.id]: msg.session } });
-      if (state.selectedId === msg.session.id && !document.hidden) markSeen(msg.session.id);
+      if (viewingSession(msg.session.id)) markSeen(msg.session.id);
       break;
     case "session_removed": {
       const { [msg.id]: _gone, ...rest } = state.sessions;
@@ -488,11 +573,15 @@ function applyPush(msg: ServerPush) {
     case "system":
       set({ system: msg.system });
       break;
+    case "usage":
+      set({ usage: msg.usage });
+      break;
     case "event": {
       const e = msg.event;
+      rememberAssistantEvents([e]);
       const t = state.transcripts[e.sessionId];
       if (t) set({ transcripts: { ...state.transcripts, [e.sessionId]: { ...t, events: mergeEvents(t.events, [e]) } } });
-      if (state.selectedId === e.sessionId && !document.hidden) markSeen(e.sessionId);
+      if (viewingSession(e.sessionId)) markSeen(e.sessionId);
       break;
     }
   }
@@ -537,6 +626,6 @@ async function connect() {
 export function startStore() {
   void connect();
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && state.selectedId) markSeen(state.selectedId);
+    if (state.selectedId && viewingSession(state.selectedId)) markSeen(state.selectedId);
   });
 }

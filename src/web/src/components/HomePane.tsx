@@ -1,15 +1,11 @@
 // Home with no coordinator (coordinator.agent "none", D34): permission prompts held for you and
 // the sessions waiting on you. Nothing coordinator-specific.
 import type { Session } from "../../../shared/types.ts";
-import { needsYou } from "../home.ts";
 import { showList, useStore } from "../store.ts";
 import { ArrowLeft } from "./Icons.tsx";
-import { PermissionCard, WaitingLink } from "./NeedsYouParts.tsx";
 
 export function HomePane() {
   const sessions = useStore((s) => s.sessions);
-  const attention = useStore((s) => s.attention);
-  const { prompts, waiting } = needsYou(attention);
   const working = Object.values(sessions).filter((s: Session) => s.execution === "working").length;
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -20,16 +16,7 @@ export function HomePane() {
         <h2 className="min-w-0 flex-1 truncate text-[14px] font-semibold">Needs you</h2>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <section aria-label="Needs you" className="mx-auto max-w-3xl space-y-3 px-4 py-4 sm:px-6">
-          {prompts.length > 0 && (
-            <ul className="space-y-2">
-              {prompts.map((i) => (
-                <PermissionCard key={i.id} item={i} sessions={sessions} recLabel={null} />
-              ))}
-            </ul>
-          )}
-          <WaitingLink count={waiting} />
-          {!prompts.length && !waiting && <p className="py-6 text-center text-[13px] text-ink-3">Nothing needs you right now.</p>}
+        <section aria-label="Sessions summary" className="px-4 py-4">
           <p className="text-[12px] text-ink-3">{working === 0 ? "No sessions are working right now." : working === 1 ? "1 session is working." : `${working} sessions are working.`}</p>
         </section>
       </div>

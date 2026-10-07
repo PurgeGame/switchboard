@@ -60,9 +60,11 @@ export class TmuxSender implements TerminalSender {
   }
 
   private guard(s: Session, pane: Pane): string | null {
-    if (!s.pid || !readStat(s.pid)) return "the agent process is gone";
-    if (ttyOf(s.pid) !== pane.tty) return "agent is not on this pane";
-    if (!isForeground(s.pid)) return "the agent is not the pane's foreground process";
+    const process = s.pid ? readStat(s.pid) : null;
+    if (!process || process.state === "Z") return "the agent process is gone";
+    if (s.meta.processStartTime !== undefined && s.meta.processStartTime !== process.startTime) return "the agent process has changed";
+    if (ttyOf(process.pid) !== pane.tty) return "agent is not on this pane";
+    if (!isForeground(process.pid)) return "the agent is not the pane's foreground process";
     return null;
   }
 
@@ -88,6 +90,16 @@ export class TmuxSender implements TerminalSender {
     return run(["-S", pane.socket, "send-keys", "-t", pane.paneId, "Enter"]).status === 0 ? { ok: true } : { ok: false, error: "tmux send-keys failed" };
   }
 
+  async quit(s: Session) {
+    const pane = this.paneFor(s);
+    if (!pane) return { ok: false, wrote: false, error: "no tmux pane for this session" };
+    const guard = this.guard(s, pane);
+    if (guard) return { ok: false, wrote: false, error: guard };
+    if (run(["-S", pane.socket, "send-keys", "-t", pane.paneId, "C-c"]).status !== 0) return { ok: false, error: "tmux send-keys failed" };
+    await Bun.sleep(300);
+    return this.send(s, s.provider === "codex" ? "/quit" : "/exit");
+  }
+
   async interrupt(s: Session): Promise<{ ok: boolean; error?: string; wrote?: boolean }> {
     const pane = this.paneFor(s);
     if (!pane) return { ok: false, error: "no tmux pane for this session", wrote: false };
@@ -108,6 +120,10 @@ export class CompositeTerminal implements TerminalSender {
   }
   send(s: Session, text: string, images?: string[]) {
     return this.pick(s)?.send(s, text, images) ?? Promise.resolve({ ok: false, error: "no terminal for this session", wrote: false });
+  }
+  quit(s: Session) {
+    const sender = this.pick(s);
+    return sender?.quit?.(s) ?? sender?.send(s, s.provider === "codex" ? "/quit" : "/exit") ?? Promise.resolve({ ok: false, wrote: false, error: "no terminal for this session" });
   }
   interrupt(s: Session) {
     return this.pick(s)?.interrupt(s) ?? Promise.resolve({ ok: false, error: "no terminal for this session", wrote: false });

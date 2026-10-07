@@ -177,7 +177,7 @@ test("H3: a failure before the provider is invoked releases the reservation and 
   expect(x.launches).toHaveLength(1);
 });
 
-test("H3: uncertain reservations stay held and escalated, leave the cap after the window, and a human clear unblocks re-grant and relaunch", async () => {
+test("H3: uncertain reservations stay held (the coordinator is told), leave the cap after the window, and a human clear unblocks re-grant and relaunch", async () => {
   const x = fixture({ limits: { maxLaunched: 1 } });
   const stuck = x.task(),
     next = x.task();
@@ -188,7 +188,9 @@ test("H3: uncertain reservations stay held and escalated, leave the cap after th
   expect(((await x.agent.callTool("launch_session", { taskId: stuck.id, repo: x.root, reason: "a" })) as any).ok).toBe(false);
   expect(x.c.reservation(stuck.id)?.state).toBe("uncertain");
   expect(x.c.claims().every((c) => c.owner.startsWith("reservation:"))).toBe(true);
-  expect(x.flags).toContain("Launch reservation needs a look");
+  // D39: the coordinator settles it after the daemon's checks (resolve_launch); you aren't handed it.
+  expect(x.flags).not.toContain("Launch reservation needs a look");
+  expect((x.agent as any).pending.some((e: any) => e.kind === "launch_uncertain")).toBe(true);
   x.deps.launch = realLaunch;
   expect(((await x.agent.callTool("launch_session", { taskId: next.id, repo: x.root, reason: "b" })) as any).error).toMatch(/cap reached/);
   x.tick(31 * 60_000);
@@ -440,12 +442,19 @@ test("P1-A5: approving a create_objective proposal creates the objective with a 
   await expect(x.agent.approve(r.result.proposal.id)).rejects.toThrow(/approved/);
 });
 
-test("P1-A5: approval fails clearly when the proposed root isn't an existing directory, creating nothing", async () => {
+test("P1-A5: a root that isn't an existing directory is refused when proposed, and again on approval, creating nothing", async () => {
   const x = fixture();
   const before = x.c.snapshot().objectives.length;
   const r: any = await x.agent.callTool("create_objective", { title: "Nowhere", root: join(x.root, "does-not-exist"), reason: "r" });
-  await expect(x.agent.approve(r.result.proposal.id)).rejects.toThrow(/not an existing directory.*Nothing was created/);
+  expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/not an existing directory/) });
+  expect(x.agent.proposals()).toHaveLength(0);
+  // It existed when proposed and is gone by the time the user taps approve.
+  const gone = join(x.root, "gone");
+  mkdirSync(gone);
+  const p: any = await x.agent.callTool("create_objective", { title: "Gone", root: gone, reason: "r" });
+  rmSync(gone, { recursive: true });
+  await expect(x.agent.approve(p.result.proposal.id)).rejects.toThrow(/not an existing directory.*Nothing was created/);
   expect(x.c.snapshot().objectives).toHaveLength(before);
-  expect(x.agent.proposal(r.result.proposal.id)!.state).toBe("pending");
+  expect(x.agent.proposal(p.result.proposal.id)!.state).toBe("pending");
   expect((await x.agent.callTool("create_objective", { title: "No root", reason: "r" })).ok).toBe(false);
 });

@@ -19,7 +19,7 @@ function Delivery({ m }: { m: OutboxMessage }) {
         );
       return (
         <span className="inline-flex items-center gap-1 text-ink-3" role="status">
-          <StatusIcon name="spinner" spin width={11} height={11} />
+          <StatusIcon name="active" width={11} height={11} />
           sending
         </span>
       );

@@ -36,6 +36,8 @@ export interface ResourceUsage {
   inferred?: boolean;
   /** A command the agent started that is still running, e.g. tests it left going after its turn ended. */
   running?: RunningCommand;
+  /** Live descendants, including sleeping commands; zombies do not count. */
+  liveChildren?: number;
 }
 
 export interface RunningCommand {
@@ -88,7 +90,40 @@ export interface Session {
   /** Newest stored event id, for unread tracking across reloads. */
   lastEventId: number | null;
   resources: ResourceUsage | null;
+  /** Claude only: the subagents it started (Agent tool), running ones first, then recently finished. */
+  subagents?: Subagent[];
+  /** Internal coordinator investigation; never an execution status or a UI warning. */
+  stallCheck?: StallCheck;
   meta: Record<string, unknown>;
+}
+
+export interface StallCheck {
+  id: string;
+  suspectedAt: number;
+  lastActivityAt: number;
+  silentForMs: number;
+  lastStep: string;
+  status: "suspected" | "working" | "stuck";
+  reason?: string;
+  suggestedAction?: string;
+}
+
+/** A subagent a Claude session started (its Agent tool), read from the subagent's own transcript. */
+export interface Subagent {
+  id: string;
+  /** Its agent type: "general-purpose", "Explore", … */
+  type: string;
+  description: string;
+  model: string | null;
+  /** The subagent that started it, when it wasn't the session itself. */
+  parentId: string | null;
+  status: "running" | "completed" | "failed" | "killed" | "stopped";
+  /** What it's doing now (its latest step), while running. */
+  activity: string | null;
+  startedAt: number;
+  lastActivityAt: number;
+  /** When it finished, or (stopped) when it was last heard from. */
+  endedAt: number | null;
 }
 
 export type EventType =
@@ -211,6 +246,8 @@ export interface DispatchContext {
   launchCwd?: string;
   /** The exact agent process the launcher started (the brief goes to it and nothing else). */
   launchPid?: number;
+  /** The user's chat message (#) this message carries out as their own instruction (userChat). */
+  userChat?: number;
 }
 
 export interface PerspectiveMember {
@@ -266,6 +303,29 @@ export interface Objective {
 
 export type Tier = "deep" | "standard" | "light";
 
+export interface UsageRecommendationSettings {
+  enabled: boolean;
+  lowRemainingPct: number;
+  stopRemainingPct: number;
+  resetSoonMinutes: number;
+  maxAgeMinutes: number;
+}
+
+/** A decision from a snapshot, never a claim that the reading is still current. */
+export interface WorkerRecommendation {
+  provider: "claude" | "codex";
+  tier: Tier;
+  model: string;
+  effort: string | null;
+  reason: string;
+  at: number;
+  queued: boolean;
+  baseTier: Tier;
+  baseReason: string;
+  tierSelected: boolean;
+  providerSelected: boolean;
+}
+
 export interface Task {
   id: string;
   objectiveId: string | null;
@@ -277,12 +337,17 @@ export interface Task {
   /** Deep = strongest model/high effort (contracts, security…); light = cheap/fast. */
   tier: Tier;
   tierReason: string | null;
+  recommendation?: WorkerRecommendation;
+  /** Human supplied a tier, rather than accepting the automatic/default choice. */
+  humanTierSelection?: boolean;
   /** Light-tier result that a decision depends on: must be checked by a higher tier before "verified". */
   needsVerification?: boolean;
   prerequisites: string[]; // task ids
   acceptance: string[];
   status: TaskStatus;
   result: string | null;
+  /** Human review notes, retained across rework and subsequent completion. */
+  feedback?: { at: number; by: "human"; note: string }[];
   evidence: { at: number; by: string; text: string }[];
   worktree: string | null;
   createdAt: number;
@@ -327,7 +392,44 @@ export type ServerPush =
   | { type: "session_removed"; id: string }
   | { type: "event"; event: SbEvent }
   | { type: "system"; system: SystemStats }
-  | ({ type: "coordinator" } & CoordinatorState);
+  | ({ type: "coordinator" } & CoordinatorState)
+  | { type: "usage"; usage: UsageSnapshot };
+
+/** One rate-limit window of a provider (e.g. Claude's 5-hour session, Codex's weekly). */
+export interface UsageWindow {
+  /** Short name: "5h", "7d", "7d opus"… */
+  label: string;
+  usedPct: number;
+  remainingPct: number;
+  /** Epoch ms when the window resets; null when the source didn't say. */
+  resetsAt: number | null;
+}
+
+export interface ProviderUsage {
+  /** A valid reading exists, possibly stale. false means usage is unknown (see note). */
+  available: boolean;
+  /** Where the reading came from, and when (epoch ms). */
+  source: string;
+  asOf: number | null;
+  plan?: string | null;
+  windows: UsageWindow[];
+  /** Last-observed values are retained on errors and after recorded reset times pass. */
+  stale?: boolean;
+  staleReason?: string | null;
+  ageMs?: number | null;
+  error?: string | null;
+  lastAttemptAt?: number | null;
+  /** Earliest retry after a failure; the monitor's regular poll performs the retry. */
+  nextRetryAt?: number | null;
+  /** Why it's unavailable or what to be careful about. */
+  note?: string;
+}
+
+export interface UsageSnapshot {
+  ts: number;
+  claude: ProviderUsage;
+  codex: ProviderUsage;
+}
 
 // ---- Coordinator agent (Phase 6). REST contract:
 //   GET  /api/coordinator                         -> CoordinatorState
@@ -363,6 +465,8 @@ export interface CoordinatorActivity {
   reason: string | null;
   outcome: "ok" | "refused" | "proposed" | "held" | "dropped" | "error" | "info";
   detail: string;
+  /** The user's chat message (#) this ran on as their own instruction (userChat), if any. */
+  userChat?: number;
 }
 
 export interface CoordinatorProposal {
@@ -394,6 +498,11 @@ export interface CoordinatorChatEntry {
   images?: string[];
   /** Where the coordinator routed this user message, once (session id). */
   routedTo?: string | null;
+  /** User entries: the coordinator's mode when it was sent, and which active period (userChat needs the current one). */
+  mode?: CoordinatorMode;
+  activePeriod?: number;
+  /** User entries: the text includes something pasted, so it can't serve as userChat. */
+  pasted?: boolean;
 }
 
 /** An approved delegation plan and where each of its tasks stands (retry applies to "failed"). */
@@ -403,12 +512,32 @@ export interface CoordinatorPlan {
   tasks: { key: string; taskId: string; title: string; state: "waiting" | "launched" | "failed" | "skipped"; error?: string }[];
 }
 
+export interface AutoEndSettings {
+  enabled: boolean;
+  idleMinutes: number;
+}
+
+export interface CoordinatorRuntimeSelection {
+  provider: "claude" | "codex";
+  model: string;
+  effort: string | null;
+}
+export interface CoordinatorRuntimeSettings {
+  selected: CoordinatorRuntimeSelection;
+  current: CoordinatorRuntimeSelection | null;
+  choices: Record<"claude" | "codex", CoordinatorRuntimeSelection>;
+  models: Record<"claude" | "codex", string[]>;
+}
+
 export interface CoordinatorState {
   /** builtin: the daemon runs the brain; external: the user's own agent polls through `sb mcp`. */
   agent: Exclude<CoordinatorAgentKind, "none">;
   /** Last MCP tool call (any outcome) since the daemon started: is an external agent connected? */
   lastToolCallAt: number | null;
+  /** Why the coordinator process last failed to start (e.g. an unsupported Codex CLI); null once it starts. */
+  runtimeError?: string | null;
   mode: CoordinatorMode;
+  autoEnd: AutoEndSettings;
   model: string;
   /** Is the coordinator process running right now. */
   running: boolean;

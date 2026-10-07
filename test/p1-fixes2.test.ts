@@ -10,6 +10,7 @@ import { CoordinatorAgent } from "../src/daemon/coordinator/agent.ts";
 import { mergeCoordinatorConfig } from "../src/daemon/coordinator/config.ts";
 import { blankSession } from "../src/daemon/state.ts";
 import type { Session } from "../src/shared/types.ts";
+import { withMessageLimits } from "./message-limits.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -38,7 +39,7 @@ function fixture(opts: { limits?: any } = {}) {
   const deps: any = {
     db: db.db,
     coordination: c,
-    cfg: mergeCoordinatorConfig({ limits: opts.limits ?? {} }),
+    cfg: mergeCoordinatorConfig(withMessageLimits({ limits: opts.limits ?? {} })),
     sessions: () => sessions,
     events: () => [],
     send: async () => ({ ok: true }),
@@ -126,11 +127,20 @@ test("2: approving a create_objective proposal grants exactly the shown root: no
   symlinkSync(secret, join(repo, "proj")); // a worker can plant this; the human sees ".../proj"
   mkdirSync(join(repo, "a"));
   const before = x.c.snapshot().objectives.length;
+  // Refused when proposed: the user never sees a card for it.
   for (const root of [join(repo, "proj"), `${repo}/a/../proj`, `${repo}/a/..`]) {
     const p: any = await x.agent.callTool("create_objective", { title: "Innocent", root, reason: "r" });
-    await expect(x.agent.approve(p.result.proposal.id)).rejects.toThrow(/Nothing was created/);
-    expect(x.agent.proposal(p.result.proposal.id)!.state).toBe("pending");
+    expect(p).toMatchObject({ ok: false, error: expect.stringMatching(/symlink|plain path/) });
   }
+  expect(x.agent.proposals()).toHaveLength(0);
+  // A symlink swapped in after the proposal is refused on approval; the proposal stays pending.
+  const later = join(repo, "later");
+  mkdirSync(later);
+  const p: any = await x.agent.callTool("create_objective", { title: "Innocent", root: later, reason: "r" });
+  rmSync(later, { recursive: true });
+  symlinkSync(secret, later);
+  await expect(x.agent.approve(p.result.proposal.id)).rejects.toThrow(/Nothing was created/);
+  expect(x.agent.proposal(p.result.proposal.id)!.state).toBe("pending");
   expect(x.c.snapshot().objectives).toHaveLength(before);
   expect(x.c.snapshot().objectives.some((o) => o.grant?.root === secret)).toBe(false);
   // A plain canonical path still works (trailing slash tolerated).
@@ -142,7 +152,8 @@ test("2: a grant root that contains the home directory is refused, like / and $H
   const x = fixture();
   const parent = dirname(realpathSync(homedir())); // e.g. /home (the in-memory store is all that changes)
   const p: any = await x.agent.callTool("create_objective", { title: "Everything", root: parent, reason: "r" });
-  await expect(x.agent.approve(p.result.proposal.id)).rejects.toThrow(/too broad/);
+  expect(p).toMatchObject({ ok: false, error: expect.stringMatching(/too broad/) });
+  expect(x.agent.proposals()).toHaveLength(0);
   expect(() => x.c.grantObjective(x.o.id, { root: parent }, "human")).toThrow(/too broad/);
   expect(x.c.snapshot().objectives.some((o) => o.grant?.root === parent)).toBe(false);
 });

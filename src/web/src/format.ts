@@ -49,3 +49,13 @@ export function clip(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
 }
+
+/** Time until a future moment, short: "45m", "2h 13m", "3d 4h". */
+export function until(ts: number | null, now: number): string {
+  if (!ts) return "?";
+  const m = Math.max(0, Math.round((ts - now) / 60_000));
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h${m % 60 ? ` ${m % 60}m` : ""}`;
+  return `${Math.floor(h / 24)}d${h % 24 ? ` ${h % 24}h` : ""}`;
+}

@@ -1,4 +1,5 @@
-import type { CoordinatorProposal, CoordinatorState, AttentionItem, Claim, Conflict, Objective, OutboxMessage, PerspectiveGroup, Task, TaskStatus, SbEvent, SendMethod, SendMode, Session, SystemStats } from "../../shared/types.ts";
+import type { CoordinatorProposal, CoordinatorState, AttentionItem, Claim, Conflict, Objective, OutboxMessage, PerspectiveGroup, Task, TaskStatus, SbEvent, SendMethod, SendMode, Session, SystemStats, UsageSnapshot } from "../../shared/types.ts";
+import type { CoordinatorRuntimeSettings, CoordinatorRuntimeSelection } from "../../shared/types.ts";
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path, { credentials: "same-origin" });
@@ -9,6 +10,7 @@ async function get<T>(path: string): Promise<T> {
 
 export const fetchSessions = () => get<Session[]>("/api/sessions");
 export const fetchSystem = () => get<SystemStats | null>("/api/system");
+export const setAutoEndSettings = (settings: CoordinatorState["autoEnd"]) => post<CoordinatorState>("/api/coordinator/auto-end", { json: settings });
 
 export function fetchEvents(sessionId: string, opts: { limit?: number; before?: number } = {}): Promise<SbEvent[]> {
   const q = new URLSearchParams({ limit: String(opts.limit ?? 200) });
@@ -61,6 +63,8 @@ export const ackAttention = (id: number) => post<unknown>(`/api/attention/${id}/
 
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 export const answerApproval = (id: number, decision: ApprovalDecision) => post<unknown>(`/api/attention/${id}/answer`, { json: { decision } });
+/** Claude's AskUserQuestion held here: one answer per question (keyed by its text) goes back to the session. */
+export const answerQuestion = (id: number, answers: Record<string, string>) => post<unknown>(`/api/attention/${id}/answer`, { json: { decision: "accept", answers } });
 
 export interface Upload {
   path: string;
@@ -151,6 +155,7 @@ export const createTask = (body: NewTask) => post<Task>("/api/tasks", { json: bo
 
 export type TaskPatch = Partial<{ status: TaskStatus; owner: string | null; tier: Task["tier"]; acceptance: string[] }>;
 export const updateTask = (id: string, patch: TaskPatch) => post<Task>(`/api/tasks/${encodeURIComponent(id)}`, { json: patch });
+export const rejectTaskWithFeedback = (id: string, note: string) => post<Task>(`/api/tasks/${encodeURIComponent(id)}/feedback`, { json: { note } });
 export const addEvidence = (id: string, text: string) => post<unknown>(`/api/tasks/${encodeURIComponent(id)}/evidence`, { json: { text } });
 export const releaseClaim = (id: number) => post<unknown>(`/api/claims/${id}/release`, {});
 export const resolveConflict = (id: string) => post<unknown>(`/api/conflicts/${encodeURIComponent(id)}/resolve`, {});
@@ -172,6 +177,7 @@ export interface GovernorSnapshot {
   log: { at: number; text: string }[];
 }
 
+export const fetchUsage = () => get<UsageSnapshot>("/api/usage");
 export const fetchGovernor = () => get<GovernorSnapshot>("/api/governor");
 export const setGameMode = (on: boolean | null) => post<GovernorSnapshot>("/api/governor/game", { json: { on } });
 export const setGamePriority = (sessionId: string, priority: GamePriority) => post<GovernorSnapshot>("/api/governor/priority", { json: { sessionId, priority } });
@@ -180,7 +186,12 @@ export const restoreSession = (sessionId: string) => post<GovernorSnapshot>("/ap
 
 // ---- Coordinator (the home screen talks to it; it handles the details)
 export const fetchCoordinator = () => get<CoordinatorState>("/api/coordinator");
-export const tellCoordinator = (text: string, images: string[] = []) => post<{ ok: boolean }>("/api/coordinator/chat", { json: { text, images } });
+export const fetchCoordinatorRuntime = () => get<CoordinatorRuntimeSettings>("/api/coordinator/runtime");
+export const saveCoordinatorRuntime = (selection: CoordinatorRuntimeSelection) => post<CoordinatorRuntimeSettings>("/api/coordinator/runtime", { json: selection });
+export const restartCoordinator = () => post<CoordinatorRuntimeSettings>("/api/coordinator/restart", { json: {} });
+/** pasted: the message includes pasted text (the coordinator can't treat it as your own instruction). */
+export const tellCoordinator = (text: string, images: string[] = [], pasted = false) =>
+  post<{ ok: boolean }>("/api/coordinator/chat", { json: { text, images, ...(pasted ? { pasted: true } : {}) } });
 export const setCoordinatorMode = (mode: CoordinatorState["mode"]) => post<CoordinatorState>("/api/coordinator/mode", { json: { mode } });
 /** `digest`: for a plan, the digest of the exact payload the card showed (the daemon refuses a mismatch). */
 export const approveProposal = (id: number, digest?: string) =>
@@ -197,3 +208,8 @@ export async function acceptTask(task: Task): Promise<void> {
 export const stopObjective = (id: string) => post<unknown>(`/api/objectives/${encodeURIComponent(id)}/revoke`, {});
 /** End a session (its history stays). */
 export const endSession = (sessionId: string) => post<{ ok: boolean; how: string; error?: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/end`, {});
+
+export interface PermissionSettings { autoApproveSafe: boolean; scope?: "workers" | "all" }
+export const fetchPermissionSettings = () => get<PermissionSettings>("/api/settings/permissions");
+export const setPermissionSettings = (autoApproveSafe: boolean) => post<PermissionSettings>("/api/settings/permissions", { json: { autoApproveSafe } });
+export const resumeSession = (sessionId: string) => post<{ ok: boolean; error?: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/resume`, {});

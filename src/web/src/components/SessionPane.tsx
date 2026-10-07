@@ -1,16 +1,18 @@
-import { useState } from "react";
+import { ProviderIcon } from "./ProviderIcon.tsx";
 import type { Session } from "../../../shared/types.ts";
-import { endSession } from "../api.ts";
+import { endSessionNow, ResumeButton, SessionActionError, useSessionAction } from "./SessionActions.tsx";
 import { baseName, duration } from "../format.ts";
 import { contextPct, modelLabel } from "../../../shared/models.ts";
 import { sessionTitle } from "../status.ts";
 import { showList, useNow, useStore } from "../store.ts";
-import { idleRunning, ProviderGlyph, RunningChip, StatusPill } from "./Badges.tsx";
+import { idleRunning, RunningChip, StatusPill } from "./Badges.tsx";
 import { ArrowLeft } from "./Icons.tsx";
 import { AutoBanner } from "./AutoBanner.tsx";
 import { JumpToTerminal } from "./JumpToTerminal.tsx";
 import { Composer } from "./Composer.tsx";
 import { Transcript } from "./Transcript.tsx";
+import { SubagentsPanel } from "./Subagents.tsx";
+import { canPinSession, SessionPlacement } from "./SessionPlacement.tsx";
 
 /** "Opus 5.5 · medium · 54% context": what's driving this session and how full its context is. */
 function ModelLine({ session: s }: { session: Session }) {
@@ -34,60 +36,45 @@ function ModelLine({ session: s }: { session: Session }) {
   );
 }
 
-/** End the session (asks once). Its history stays; only shown when Switchboard can reach it. */
-function EndButton({ session: s }: { session: Session }) {
-  const [confirming, setConfirming] = useState(false);
-  const [note, setNote] = useState<string | null>(null);
-  if (s.execution === "ended" || (!s.sendMethods.length && s.pidConfidence !== "confirmed")) return null;
-  const end = async () => {
-    setConfirming(false);
-    setNote("Ending…");
-    try {
-      const r = await endSession(s.id);
-      setNote(r.ok ? null : (r.error ?? "Couldn't end it"));
-    } catch (e) {
-      setNote((e as Error).message);
-    }
-  };
-  if (note) return <span className="max-w-[16rem] truncate text-[11px] text-ink-3" title={note}>{note}</span>;
-  return confirming ? (
-    <span className="flex items-center gap-1.5 text-[12px]">
-      <span className="text-ink-3">End it? History stays.</span>
-      <button onClick={() => void end()} className="rounded-md border border-red/50 px-2 py-0.5 text-red hover:bg-red/10">
-        End
-      </button>
-      <button onClick={() => setConfirming(false)} className="rounded-md px-2 py-0.5 text-ink-3 hover:bg-hover">
-        Cancel
-      </button>
-    </span>
-  ) : (
-    <button onClick={() => setConfirming(true)} title="End this session" className="rounded-md border border-line px-2 py-0.5 text-[12px] text-ink-3 hover:bg-hover hover:text-ink">
-      End
-    </button>
-  );
-}
+/** The server resolves inferred mappings from the transcript and reports ambiguity inline. */
+const canEnd = (s: Session) => s.execution !== "ended" && (s.provider === "claude" || s.provider === "codex");
 
 function PaneHeader({ session: s }: { session: Session }) {
   const now = useNow();
+  const action = useSessionAction(s.id);
   const idleRun = idleRunning(s);
   const elapsed = s.execution === "working" && s.turnStartedAt ? duration(now - s.turnStartedAt) : idleRun ? duration(Math.max(0, now - idleRun.since)) : undefined;
   return (
-    <div className="flex items-center gap-2.5 border-b border-line px-3 py-2 sm:px-4">
-      <button onClick={showList} aria-label="Back to session list" className="rounded p-1 text-ink-2 hover:bg-hover lg:hidden">
-        <ArrowLeft width={16} height={16} />
-      </button>
-      <ProviderGlyph provider={s.provider} size={16} />
-      <div className="min-w-0 flex-1">
-        <h2 className="truncate text-[14px] font-semibold">{sessionTitle(s)}</h2>
-        <p className="flex min-w-0 items-baseline gap-1.5 truncate text-[11px] text-ink-3">
-          <span className="truncate">{s.cwd ? baseName(s.cwd) : ""}</span>
-          <ModelLine session={s} />
-        </p>
+    <div className="border-b border-line">
+      <div className="flex items-center gap-2.5 px-3 py-2 sm:px-4">
+        <button onClick={showList} aria-label="Back to session list" className="rounded p-1 text-ink-2 hover:bg-hover lg:hidden">
+          <ArrowLeft width={16} height={16} />
+        </button>
+        <ProviderIcon provider={s.provider} size={16} />
+        <div className="min-w-0 flex-1">
+          <h2 className="truncate text-[14px] font-semibold">{sessionTitle(s)}</h2>
+          <p className="flex min-w-0 items-baseline gap-1.5 truncate text-[11px] text-ink-3">
+            <span className="truncate">{s.cwd ? baseName(s.cwd) : ""}</span>
+            <ModelLine session={s} />
+          </p>
+        </div>
+        <JumpToTerminal session={s} />
+        <StatusPill session={s} elapsed={elapsed} />
+        {/* Phones: no room beside the title and End (the row shows it). */}
+        {s.execution === "working" && s.resources?.running && (
+          <span className="hidden sm:contents">
+            <RunningChip running={s.resources.running} now={now} />
+          </span>
+        )}
+        <ResumeButton session={s} />
+        {canEnd(s) && (
+          <button disabled={!!action?.pending} onClick={() => void endSessionNow(s.id)} title="End this session" className="shrink-0 rounded-md border border-line px-2 py-0.5 text-[12px] text-ink-3 hover:bg-hover hover:text-ink">
+            {action?.pending === "ending" ? "Ending…" : "End"}
+          </button>
+        )}
       </div>
-      <JumpToTerminal session={s} />
-      <StatusPill session={s} elapsed={elapsed} />
-      {s.execution === "working" && s.resources?.running && <RunningChip running={s.resources.running} now={now} />}
-      <EndButton session={s} />
+      <SessionActionError sessionId={s.id} />
+      {canPinSession(s) && <div className="px-3 pb-2 sm:px-4"><SessionPlacement session={s} /></div>}
     </div>
   );
 }
@@ -118,7 +105,8 @@ export function SessionPane({ session }: { session: Session | undefined }) {
   }
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <PaneHeader session={session} />
+      <PaneHeader key={`head:${session.id}`} session={session} />
+      <SubagentsPanel agents={session.subagents} />
       <Transcript key={session.id} sessionId={session.id} transcript={transcript} />
       <ComposerArea session={session} />
     </div>

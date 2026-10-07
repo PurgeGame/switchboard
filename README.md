@@ -3,7 +3,7 @@
 A local control room for your AI coding sessions. One web page shows every running Claude Code and Codex session on this machine, tells you which ones need you, lets you message them, and can coordinate and throttle them. It is a Bun + TypeScript daemon (`switchboardd`), a React UI and a small CLI (`sb`).
 
 - **Observe:** every live Claude and Codex session, with provider, folder, name, status, transcript and process-tree CPU/RAM.
-- **Attention:** a persistent inbox of questions, approvals, finished long turns, failures, stalls and conflicts. An item stays until it is actually answered.
+- **Attention:** a persistent inbox of questions, approvals, finished long turns, failures and coordinator escalations. Suspected stalls are investigated silently; only confirmed problems appear in **Needs you**, with a reason and suggested action. An item stays until it is actually answered.
 - **Control:** send messages (genuine user turns where the provider allows it), queue, steer, interrupt, approve, paste screenshots, launch sessions.
 - **Coordinate:** Perspectives (ask several agents, compare, synthesize), tasks, claims, conflict detection, an optional coordinator agent, and a resource governor with a game mode.
 
@@ -71,7 +71,12 @@ One page, built to show decisions rather than plumbing.
 - **Session list:** every live session, grouped by project, with status ("Working 3m", "Needs answer", "Tests running 12m"…). Filters: All / Needs you / Working; `/` searches. Sessions the coordinator started for its own work collapse into "Background agents" at the bottom.
 - **Session pane:** transcript, model · effort · context %, one message box (attach, Stop, Send). Messages to a busy session show "Queued" and deliver when its turn ends.
 - **Coordinator** (pinned first): a chat with the coordinator agent, plus **Needs you** cards pinned above the chat (plans to approve, finished work to OK, permission prompts, failed launches with Retry) and **What's happening**. It's off until you turn it on. See `docs/COORDINATOR.md`. With `coordinator.agent: "external"` your own agent is the brain and the chat box gives way to a connection note; with `"none"` this is a plain **Needs you** home instead.
-- **Inbox** (`i`): attention items grouped by urgency. Questions can be answered inline.
+- **Needs you**: pinned above every screen, with a count. Pending proposals, permission prompts, finished work awaiting “Looks good”, failed plan launches, coordinator escalations (including confirmed stalls), and sessions requesting your reply appear together. Actions are inline; tap the summary for full details or Reply to focus the session composer. Resolved items disappear, including after reconnecting. Routine coordinator notices and questions being auto-continued are excluded.
+- **Attention history** (`i`): resolved and auto-handled attention items.
+
+**Phone notifications:** open Switchboard over HTTPS and tap **Enable notifications** once in Needs you. On iPhone, first add Switchboard to the Home Screen and open it there. Web push works with the PWA closed; there is no polling tab to keep open. The daemon stores the VAPID key, subscriptions and per-device delivery ledger in its database, so reconnects and restarts do not repeat alerts. Transient delivery failures retry; expired subscriptions are removed. Disable notifications in Settings. Signing out or revoking browser sessions removes their subscriptions. Browser-login expiry alone does not disable phone alerts; opening the UI may require signing in again. The service worker caches no transcripts or authenticated pages.
+
+Push uses the browser vendor’s delivery service (encrypted payloads, via the `web-push` library). The browser and OS still control permission and delivery. Background notifications require the daemon to remain running. By default a notification says only how many items need you (open it for the details); `push.details: true` in `config.json` shows each item's text, including commands and paths, on the lock screen.
 
 Auto-continue: when a session stops only to ask "shall I continue?" about work you already asked for, Switchboard replies after a cancellable grace period, labeled as auto and logged with the quoted authorization. Real choices, new scope, destructive actions and approvals always come to you.
 
@@ -79,11 +84,11 @@ Auto-continue: when a session stops only to ask "shall I continue?" about work y
 
 | Key | Action |
 |---|---|
-| `j` / `k` | next / previous session (or inbox item when the inbox is open) |
+| `j` / `k` | next / previous session |
+| `Enter` | open the selected session |
 | `/` | search sessions |
-| `i` | toggle the inbox |
-| `r` | reply: focus the message box (or the inline reply for a question item) |
-| `a` | acknowledge the selected inbox item |
+| `i` | toggle attention history |
+| `r` | reply: focus the selected session's message box |
 | `g` then `c` (or `h`) / `s` | the coordinator / the session list |
 | `Esc` | close the topmost thing, then back to the list |
 
@@ -133,11 +138,17 @@ State lives in `~/.local/share/switchboard` (SQLite database, uploads, bridge so
   "notifyIgnore": ["/.sandbox/"],
   "modelClassifier": true,
   "autoContinue": { "enabled": true, "graceMs": 10000, "maxConsecutive": 3, "typingHoldMs": 120000, "offProjects": ["/home/me/Dev/secret-repo"] },
+  "autoApproveSafePermissions": false,
+  "usage": { "claudeOAuth": false },
+  "push": { "details": false, "subject": "mailto:switchboard@localhost" },
   "governor": { "memPressureHigh": 10, "memAvailableLowPct": 15, "restoreAfterMs": 120000, "eCores": "16-31", "allCores": "0-31", "gameProcesses": ["SomeGame.exe"] },
   "coordinator": {
     "agent": "builtin",
-    "model": "sonnet",
-    "limits": { "maxLaunched": 3, "dailyBudgetUsd": 10 },
+    "provider": "claude",
+    "model": "opus",
+    "effort": "xhigh",
+    "codex": { "model": "gpt-6.1-sol", "effort": "high" },
+    "limits": { "maxLaunched": 3, "dailyBudgetUsd": 10, "perSessionCooldownMs": 600000, "perSessionPerHour": 6 },
     "tierRules": [{ "glob": "contracts/**", "tier": "deep", "reason": "smart contracts" }],
     "worktreeRoot": "~/Dev/.switchboard-worktrees"
   }
@@ -145,17 +156,21 @@ State lives in `~/.local/share/switchboard` (SQLite database, uploads, bridge so
 ```
 
 - `longRunMs`: turns at least this long that end without a question raise a Finished item.
-- `notifyDesktop`: desktop notifications (`notify-send`) are off; attention lives in the web UI. Browser notifications for urgent items are opt-in in the UI's settings.
+- `notifyDesktop`: desktop notifications (`notify-send`) are off; attention lives in the web UI. Phone web push for the Needs you list is opt-in using its Enable notifications button.
 - `modelClassifier`: a cheap Haiku call (your Claude login) for turn endings the rules can't classify. Set `false` to never call a model.
 - `governor.eCores` / `allCores`: the CPU lists used by game mode. The defaults match one particular CPU: set them for yours.
+- `autoApproveSafePermissions`: `false` (default), `true` or `"all"`. See [the safe permission policy](#coordinator-built-in-your-own-or-none) below.
+- `usage.claudeOAuth`: **off by default.** When `true`, the daemon reads your Claude Code login's OAuth access token from `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`; never refreshed or written by Switchboard) and calls `GET https://api.anthropic.com/api/oauth/usage` (the undocumented endpoint the Claude CLI itself uses) to show your 5-hour and 7-day usage windows. It polls at most every 2 minutes (checked every 30 seconds), backs off 10 minutes after an error (doubling, up to an hour), and only while the daemon runs. The token is sent only to that endpoint. Codex usage needs no setting: it comes from your local Codex rollout logs.
+- `push.details`: phone notifications pass through the browser vendor's push service and show on a lock screen, so by default they say only "N items need you" with a link; `true` puts each item's text (commands, paths, questions) in the notification. `push.subject` is the VAPID contact sent to push services (generic by default).
 - `coordinator.agent`: who coordinates: `"builtin"` (default), `"external"` (your own agent) or `"none"`. See the next section. Restart the daemon after changing it.
+- **Settings → Coordinator** selects Claude (default) or Codex and its model for the next coordinator start. **Use Codex now** switches a running Claude coordinator in one click; **Restart coordinator** applies other saved choices without restarting the daemon or losing work. Codex requires exactly CLI 0.160.1 and a ChatGPT file login (with another version the coordinator does not start, and its header and Settings say why); see [runtime setup and differences](docs/COORDINATOR.md#switching-claude--codex).
 - `coordinator`: full key list and meaning in `docs/COORDINATOR.md`.
 
 ## Coordinator: built-in, your own, or none
 
 Session management (the list, transcripts, messaging, the inbox, permission prompts) works the same with any of these. Set `coordinator.agent` in `config.json`:
 
-- **`"builtin"`** (default): Switchboard runs its own Claude process as the coordinator, off until you turn it on. You chat with it on the home screen.
+- **`"builtin"`** (default): Switchboard runs its own Codex or Claude process as the coordinator, off until you turn it on. You chat with it on the home screen.
 - **`"external"`**: your own agent (Claude Code, Codex, anything that speaks MCP) is the coordinator. Switchboard never starts a model or spends anything for it. The coordinator's rules (on/paused/off, authority, approvals, holds, rate and launch limits) are enforced by the daemon exactly as for the built-in one. The home screen keeps the coordinator's cards and progress, without a chat box: you talk to your agent in its own window. Connect it once:
 
   ```bash
@@ -164,7 +179,24 @@ Session management (the list, transcripts, messaging, the inbox, permission prom
   ```
 
   Then turn the coordinator on in the UI and tell your agent to call `get_instructions` and follow it. Details, and what an external agent can and can't do, in `docs/COORDINATOR.md`.
-- **`"none"`**: no coordinator anywhere. The home row becomes **Needs you**: permission prompts (Allow / Deny) and sessions waiting for you. Every permission prompt comes to you; `/api/coordinator*` answers 404.
+- **`"none"`**: no coordinator anywhere. The home row becomes **Needs you**: permission prompts (Allow / Deny) and sessions waiting for you. The safe permission policy still works; all other permission prompts come to you. `/api/coordinator*` answers 404.
+
+Settings → **Auto-approve safe permissions** is **off by default** (D44). When off, every permission request is an Allow/Deny card. The switch applies to every device, persists across daemon restarts, and works with any coordinator mode. `autoApproveSafePermissions` in `config.json` sets the switch's initial state and how far it reaches when on:
+
+| `autoApproveSafePermissions` | Read-only rules | Verification commands (run project code) |
+|---|---|---|
+| `false` (default) | off until switched on in Settings (then as `true`) | as `true` once switched on |
+| `true` | any session not excluded from coordination | only coordinator-launched workers running inside their own Switchboard worktree (under `coordinator.worktreeRoot`) |
+| `"all"` | any session not excluded | any session not excluded |
+
+Sessions excluded from coordination are never auto-approved. Codex approvals follow the same switch and rules as Claude's permission hook.
+
+The read-only rules approve a reviewed subset of `cat`, `ls`, `head`, `tail`, `wc`, `rg`, `grep`, `pwd`, Claude `Read`, and local `git status/log/diff`, after checking the session's recorded worktree or project, actual cwd, resolved paths and relevant Git configuration. Each approval records the exact call and rule in the inbox's **Auto-handled** activity and, when a coordinator exists, its activity log. A call denied by a provider prompt nobody could answer (Claude's auto-mode classifier or a prompt it couldn't show, Codex's automatic approval review) that the policy approves gets one exact-call retry. Denials from your own settings deny rules, hooks or configuration, explicit human denials, historical events and repeated denials without execution remain cards. Once the command executes, later runs can be approved again. Failed or uncertain retry delivery returns to a card.
+
+Verification commands: Bun tests and `test/e2e/*.ts` entrypoints; package scripts through Bun/npm/pnpm/Yarn; Cargo test/build/check/clippy; pytest and `python -m pytest`; Go test/vet; Forge test/build; and `make test`. Package scripts must be defined in the nearest in-repository `package.json` and named `test`, `typecheck`, `build`, `lint` (including colon variants), or `e2e*`. These execute arbitrary repository code (which the agent may have just written); the policy does not audit script bodies or impose runtime isolation. That is why, by default, only coordinator workers in their own worktree get them automatically.
+
+Every command in a `;`, `&&`, `||` or `|` chain must be approved. Explicit paths and output redirections must stay inside the worktree, including outputs that do not exist yet. A redirection never writes `.mcp.json`, `.vscode/`, `.husky/`, `.github/`, `package.json`, `Makefile`/`makefile`, lockfiles (`package-lock.json`, `bun.lock`, `bun.lockb`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `go.sum`), `.git/`, `.claude/`, `.codex/`, `.envrc` or `.env*`, and a `>` that would overwrite an existing file tracked by Git asks. Symlinks, traversal, sensitive explicit paths, substitutions, environment overrides, sudo, unknown options and direct installs stay Allow/Deny cards. Ordinary recursive reads still require a bounded metadata check for hidden/ignored secrets and links. Git helpers, alternate object stores, submodules, partial clones and staged secrets prevent automatic Git approval. These checks assume trusted binaries/provider environments and inspect the filesystem at decision time.
+
 
 ## Resource governor and game mode
 
@@ -202,7 +234,7 @@ bunx tsc --noEmit -p .    # types
 bun run e2e               # Playwright end-to-end tests with your installed Chrome
 ```
 
-The simulator (`test/sim/claude-sim.ts`) writes fake Claude registry files and transcripts into a temp directory, backed by harmless `sleep` processes. The e2e run starts an isolated daemon on port 7795 with its own data and config directories (under `.sandbox/`), discovering only simulated sessions. It restarts that daemon as `coordinator.agent` "none" and "external" for the UI checks of each, and never touches the daemon on 7777.
+The simulator (`test/sim/claude-sim.ts`) writes fake Claude registry files and transcripts into a temp directory, backed by harmless `sleep` processes. The e2e run starts an isolated daemon on an unused local port with its own data and config directories (under `.sandbox/`), discovering only simulated sessions. Local protocol stand-ins exercise Claude/Codex Settings switches without provider calls. It restarts that daemon as `coordinator.agent` "none" and "external" for the UI checks of each, and never touches the daemon on 7777.
 
 ## Uninstall
 

@@ -68,3 +68,11 @@ export function sameText(a: string, b: string): boolean {
   const n = Math.min(x.length, y.length);
   return n >= 200 && x.slice(0, 200) === y.slice(0, 200);
 }
+
+/**
+ * Did this edit insert more text at once than typing does? Clipboard chips on phone keyboards,
+ * dictation, autofill and drag-and-drop insert text without a paste event; counting them as pasted
+ * is the safe side (the coordinator then puts the action to you as a card).
+ */
+export const PASTE_LIKE_CHARS = 24;
+export const insertedAtOnce = (prev: string, next: string) => next.length - prev.length > PASTE_LIKE_CHARS;

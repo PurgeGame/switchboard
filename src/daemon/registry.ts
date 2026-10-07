@@ -1,13 +1,14 @@
 // Session registry: periodic discovery, transcript tailers, state, resources, persistence.
 import { contextWindowFor } from "../shared/models.ts";
 import { spawnSync } from "node:child_process";
-import type { SbEvent, ServerPush, Session } from "../shared/types.ts";
+import type { SbEvent, ServerPush, Session, StallCheck } from "../shared/types.ts";
 import type { Adapter, Discovered } from "./adapters/types.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
-import { childrenIndex, cmdlineOf, CpuSampler, descendants, rssMB, runningCommand, runsSwitchboardMcp, snapshot, type ProcInfo } from "./proc.ts";
-import { applyEvent, blankSession, checkStalled, isRunning, mergeLiveStatus } from "./state.ts";
+import { childrenIndex, cmdlineOf, readStat, CpuSampler, descendants, rssMB, runningCommand, runsSwitchboardMcp, snapshot, type ProcInfo } from "./proc.ts";
+import { applyEvent, blankSession, canSuspectStall, checkStalled, isRunning, mergeLiveStatus, stallActivityAt, stepSummary } from "./state.ts";
 import { JsonlTail, readHead } from "./tail.ts";
+import { ClaudeSubagents } from "./adapters/claude-subagents.ts";
 import type { AttentionEngine } from "./attention.ts";
 import type { Execution } from "../shared/types.ts";
 
@@ -29,11 +30,17 @@ export class Registry {
   private gitCache = new Map<string, { at: number; top: string | null; branch: string | null }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
+  private subagents = new ClaudeSubagents();
   readonly adapters: Adapter[];
   attention: AttentionEngine | null = null;
   /** Computes derived fields (send methods, controls) before a session is pushed. */
   decorate: ((s: Session) => void) | null = null;
   readonly eventHooks: ((e: SbEvent) => void)[] = [];
+  /** Called after a session's execution state changes (e.g. it ended), with the previous state. */
+  readonly execHooks: ((s: Session, prev: Execution) => void)[] = [];
+
+  /** Internal events, never transcript entries or attention items. */
+  readonly stallHooks: ((s: Session, check: StallCheck) => void)[] = [];
 
   constructor(
     adapters: Adapter[],
@@ -43,7 +50,10 @@ export class Registry {
     this.adapters = adapters;
     // Restore persisted sessions; reconciliation on the first tick decides what is still live.
     // Merge over current defaults so sessions saved by an older version get new fields.
-    for (const s of store.loadSessions()) this.sessions.set(s.id, { ...blankSession(s.id, s.provider, s.kind, s.nativeId), ...s });
+    for (const s of store.loadSessions()) {
+      if (s.execution === "stalled") s.execution = "working"; // migrate the old inferred status
+      this.sessions.set(s.id, { ...blankSession(s.id, s.provider, s.kind, s.nativeId), ...s });
+    }
   }
 
   onPush(fn: (m: ServerPush) => void) {
@@ -107,18 +117,14 @@ export class Registry {
       // Drop long-ended sessions.
       for (const s of [...this.sessions.values()])
         if (s.execution === "ended" && s.endedAt && now - s.endedAt > this.cfg.endedRetentionMs) {
+          if (s.transcriptPath) this.subagents.forget(s.transcriptPath);
           this.sessions.delete(s.id);
           this.store.deleteSession(s.id);
           this.push({ type: "session_removed", id: s.id });
         }
       this.sampleResources(procs, kids, now);
-      for (const s of this.sessions.values()) {
-        const prevExec = s.execution;
-        if (checkStalled(s, now, this.cfg.stalledMs)) {
-          this.dirty.add(s.id);
-          this.execChanged(s, prevExec, now);
-        }
-      }
+      this.sampleSubagents(now);
+      for (const s of this.sessions.values()) this.checkStall(s, now);
       this.flush();
     } finally {
       this.ticking = false;
@@ -132,6 +138,16 @@ export class Registry {
       s = blankSession(d.id, d.provider, d.kind, d.nativeId);
       this.sessions.set(d.id, s);
     }
+    // A stale discovery that started before a confirmed close must not revive it. Only a
+    // newly identified process can resume an explicitly ended conversation.
+    if (s.meta.closedProcess) {
+      const old = s.meta.closedProcess as { pid: number; startTime: number };
+      const live = d.pid ? readStat(d.pid) : null;
+      if (d.pidConfidence !== "confirmed" || !live || live.state === "Z" ||
+          old.pid === d.pid && old.startTime === live.startTime) return;
+    }
+    delete s.meta.closedProcess;
+    delete s.meta.resumePending;
     const before = JSON.stringify(s);
     if (s.execution === "ended") {
       // Came back (e.g. daemon restart raced a scan): revive.
@@ -142,6 +158,7 @@ export class Registry {
     s.name = d.name ?? s.name;
     s.cwd = d.cwd ?? s.cwd;
     s.pid = d.pid;
+    s.meta.processStartTime = d.pid ? readStat(d.pid)?.startTime : undefined;
     s.pidConfidence = d.pidConfidence;
     s.tty = d.tty;
     s.connection = d.connection;
@@ -172,27 +189,102 @@ export class Registry {
     if (isNew || JSON.stringify(s) !== before) this.dirty.add(s.id);
   }
 
+  /** Called only once the end path has verified the original process is gone. */
+  confirmEnded(sessionId: string, identity = { pid: this.sessions.get(sessionId)?.pid ?? null, startTime: 0 }) {
+    const s = this.sessions.get(sessionId);
+    if (!s) return;
+    this.endSession(s, Date.now());
+    // End may have resolved a different process than discovery's inferred mapping. Keep
+    // the verified identity with the closed session rather than persisting that old guess.
+    if (identity.pid && identity.startTime) {
+      s.pid = identity.pid;
+      s.pidConfidence = "confirmed";
+      s.meta.processStartTime = identity.startTime;
+    }
+    s.meta.closedProcess = identity;
+    this.flush();
+  }
+
   private endSession(s: Session, now: number) {
-    const prevExec = s.execution;
-    s.execution = "ended";
-    s.executionConfidence = "confirmed";
-    s.endedAt = now;
-    s.turnStartedAt = null;
-    s.connection = "disconnected";
-    s.resources = null;
     const w = this.watches.get(s.id);
     if (w) {
-      w.tail.poll(); // catch final lines
+      w.tail.poll(); // final transcript lines must not overwrite the ended state below
       w.tail.stop();
       this.watches.delete(s.id);
     }
+    const prevExec = s.execution;
+    s.execution = "ended";
+    s.executionConfidence = "confirmed";
+    s.endedAt ??= now;
+    s.turnStartedAt = null;
+    s.connection = "disconnected";
+    s.resources = null;
+    s.sendMethods = [];
+    s.controls = { interrupt: false, steer: false, queue: false, approve: false };
     this.execChanged(s, prevExec, now);
     this.decorate?.(s);
     this.dirty.add(s.id);
   }
 
   private execChanged(s: Session, prev: Execution, now: number) {
-    if (s.execution !== prev) this.attention?.onExecutionChange(s, prev, now);
+    this.clearStaleStall(s, now);
+    if (s.execution === prev) return;
+    this.attention?.onExecutionChange(s, prev, now);
+    for (const h of this.execHooks)
+      try {
+        h(s, prev);
+      } catch (err) {
+        console.error(`[registry] execution hook failed for ${s.id}:`, err);
+      }
+  }
+
+  private stallEligible(s: Session) {
+    return canSuspectStall(s) && !this.attention?.open(s.id).some((i) => i.kind === "question" || i.kind === "approval");
+  }
+
+  private clearStaleStall(s: Session, now: number) {
+    if (!s.stallCheck || (this.stallEligible(s) && s.stallCheck.lastActivityAt === stallActivityAt(s))) return;
+    delete s.stallCheck;
+    this.attention?.resolveStall(s.id, "activity resumed or the session is waiting or running work", now);
+    this.dirty.add(s.id);
+  }
+
+  /** One investigation per silent episode; a working verdict suppresses repeats until progress. */
+  checkStall(s: Session, now = Date.now()) {
+    this.clearStaleStall(s, now);
+    if (!s.stallCheck && this.stallEligible(s) && checkStalled(s, now, this.cfg.stalledMs)) {
+      const last = this.store.events(s.id, { limit: 80 }).findLast((e) => ["tool_call", "assistant_msg", "turn_started"].includes(e.type));
+      s.stallCheck = {
+        id: `${now}:${stallActivityAt(s)}`, suspectedAt: now, lastActivityAt: stallActivityAt(s)!,
+        silentForMs: now - stallActivityAt(s)!, lastStep: String(s.meta.lastStep ?? (last ? stepSummary(last) : s.meta.lastContentType ?? "unknown")), status: "suspected",
+      };
+      this.dirty.add(s.id);
+    }
+    // The coordinator dedupes by id. Offering pending checks also handles off -> on and restart.
+    if (s.stallCheck?.status === "suspected") for (const h of this.stallHooks) {
+      try { h(s, s.stallCheck); }
+      catch (err) { console.error(`[registry] stall hook failed for ${s.id}:`, err); }
+    }
+  }
+
+  reportStall(sessionId: string, checkId: string, status: "working" | "stuck", reason: string, suggestedAction?: string) {
+    const s = this.sessions.get(sessionId);
+    if (!s) throw new Error("unknown session");
+    this.clearStaleStall(s, Date.now());
+    const check = s.stallCheck;
+    if (!check || check.id !== checkId) {
+      if (status === "working") return { resolved: true, stale: true };
+      throw new Error("stall check is stale; get_session again before assessing it");
+    }
+    if (status === "stuck" && check.status === "working") throw new Error("stall check already resolved as working");
+    if (status === "stuck" && !suggestedAction?.trim()) throw new Error("a confirmed problem needs a suggestedAction");
+    if (status === "stuck" && !this.attention) throw new Error("attention is unavailable");
+    Object.assign(check, { status, reason, suggestedAction: status === "stuck" ? suggestedAction : undefined });
+    if (status === "stuck") this.attention!.confirmStall(s, check);
+    else this.attention?.resolveStall(s.id, reason);
+    this.dirty.add(s.id);
+    this.flush();
+    return check;
   }
 
   /** Apply an out-of-band change (hooks, attention decisions) and notify. */
@@ -201,6 +293,7 @@ export class Registry {
     if (!s) return false;
     const prev = s.execution;
     fn(s);
+    if (s.meta.closedProcess) { s.execution = "ended"; s.turnStartedAt = null; }
     this.execChanged(s, prev, Date.now());
     this.dirty.add(s.id);
     return true;
@@ -245,6 +338,7 @@ export class Registry {
   ingest(sessionId: string, events: SbEvent[], patch?: Record<string, unknown>) {
     const s = this.sessions.get(sessionId);
     if (!s) return;
+    if (s.meta.closedProcess) return; // late hooks from the exited process cannot revive it
     let changed = false;
     for (const e of events) {
       const stored = this.store.insertEvent(e);
@@ -299,6 +393,7 @@ export class Registry {
           changed = true;
         }
     }
+    this.clearStaleStall(s, Date.now());
     if (changed) this.dirty.add(sessionId);
   }
 
@@ -329,12 +424,13 @@ export class Registry {
       }
       const all = new Set<number>();
       for (const r of roots) for (const p of descendants(r, kids)) all.add(p);
-      let cpu = 0, rss = 0, n = 0;
+      let cpu = 0, rss = 0, n = 0, liveChildren = 0;
       let top: { pid: number; name: string; cpuPct: number; rssMB: number } | undefined;
       for (const pid of all) {
         const p = procs.get(pid);
         if (!p) continue;
         n++;
+        if (pid !== s.pid && p.state !== "Z" && p.state !== "X") liveChildren++;
         const c = cpuOf.get(pid) ?? 0;
         const m = rssMB(p);
         cpu += c;
@@ -350,11 +446,34 @@ export class Registry {
         else delete s.meta.coordinatorClient;
         this.dirty.add(s.id);
       }
-      const next = { cpuPct: Math.round(cpu * 10) / 10, rssMB: Math.round(rss), procs: n, top: top && (top.cpuPct > 1 || top.rssMB > 200) ? { ...top, cpuPct: Math.round(top.cpuPct), rssMB: Math.round(top.rssMB) } : undefined, inferred: extra?.inferred || undefined, running };
+      const next = { cpuPct: Math.round(cpu * 10) / 10, rssMB: Math.round(rss), procs: n, liveChildren, top: top && (top.cpuPct > 1 || top.rssMB > 200) ? { ...top, cpuPct: Math.round(top.cpuPct), rssMB: Math.round(top.rssMB) } : undefined, inferred: extra?.inferred || undefined, running };
       // Avoid churn: only push when something moved noticeably.
       const prev = s.resources;
-      if (!prev || Math.abs(prev.cpuPct - next.cpuPct) >= 2 || Math.abs(prev.rssMB - next.rssMB) >= 20 || prev.procs !== next.procs || prev.top?.pid !== next.top?.pid || prev.running?.since !== running?.since || prev.running?.kind !== running?.kind) {
+      if (!prev || Math.abs(prev.cpuPct - next.cpuPct) >= 2 || Math.abs(prev.rssMB - next.rssMB) >= 20 || prev.procs !== next.procs || prev.liveChildren !== next.liveChildren || prev.top?.pid !== next.top?.pid || prev.running?.since !== running?.since || prev.running?.kind !== running?.kind) {
         s.resources = next;
+        this.dirty.add(s.id);
+      }
+    }
+  }
+
+  /** Claude sessions' subagents (from their transcripts on disk). Pushed only when one changes. */
+  private sampleSubagents(now: number) {
+    for (const s of this.sessions.values()) {
+      if (s.provider !== "claude" || !s.transcriptPath) continue;
+      const live = s.execution !== "ended";
+      // An ended session's agents are settled once (any still running stopped with it), then left alone.
+      if (!live && !s.subagents?.some((a) => a.status === "running")) continue;
+      let next: NonNullable<Session["subagents"]>;
+      try {
+        next = this.subagents.read(s.transcriptPath, live, s.startedAt, now);
+      } catch (e) {
+        console.error(`[subagents] ${s.id}:`, e);
+        continue;
+      }
+      // lastActivityAt moves all the time; what's shown (status, step, timing) decides a push.
+      const key = (list: Session["subagents"]) => JSON.stringify((list ?? []).map(({ lastActivityAt: _, ...a }) => a));
+      if (key(next) !== key(s.subagents)) {
+        s.subagents = next.length ? next : undefined;
         this.dirty.add(s.id);
       }
     }

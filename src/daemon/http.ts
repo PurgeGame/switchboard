@@ -7,21 +7,28 @@
 // - body limit: 1 MB for JSON, 21 MB for image uploads; Sec-Fetch-Site must not be cross-site
 // - Host and Origin are validated on every HTTP and WebSocket request (DNS rebinding, CSRF)
 // - no CORS headers at all
+import { needsYouItems } from "../shared/needs-you.ts";
+import { NeedsYouPush } from "./push.ts";
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { join, normalize } from "node:path";
+import { SessionResumer } from "./resume.ts";
 import { Auth, clearedCookie, coordinatorAllowed, sessionCookie, type Principal } from "./auth.ts";
 import type { CoordinatorAgentKind, ServerPush, SystemStats } from "../shared/types.ts";
 import type { Store } from "./db.ts";
 import type { Registry } from "./registry.ts";
 import type { AttentionEngine } from "./attention.ts";
 import { handleHook, preToolUse } from "./hooks.ts";
+import type { SafePermissionPolicy } from "./permission-policy.ts";
 import type { PermissionBroker } from "./permissions.ts";
 import { toolSummary } from "./adapters/parse-claude.ts";
+import { deniedCallReply, type DeniedToolCall } from "./adapters/tool-denial.ts";
 import type { Coordination } from "./coordination.ts";
 import type { Governor, Priority } from "./governor.ts";
+import type { UsageMonitor } from "./usage.ts";
 import type { CoordinatorAgent } from "./coordinator/agent.ts";
+import { readRuntimeSettings, saveRuntimeSelection } from "./coordinator/config.ts";
 import { SendError, type Messenger } from "./messaging.ts";
 import type { CodexLive } from "./adapters/codex-live.ts";
 import type { Uploads } from "./uploads.ts";
@@ -57,11 +64,16 @@ export interface HttpDeps {
   perspectives: Perspectives;
   coordination: Coordination;
   governor: Governor;
+  usage: UsageMonitor;
   /** Absent with coordinator.agent "none": every /api/coordinator* route is then a 404. */
   coordinator?: CoordinatorAgent;
   /** Which coordinator is configured (D34); tells the UI in the WS hello. Default "builtin". */
   coordinatorAgent?: CoordinatorAgentKind;
+  /** Isolated Settings storage in tests; production defaults to paths.configDir. */
+  coordinatorConfigDir?: string;
   permissions?: PermissionBroker;
+  push?: NeedsYouPush;
+  permissionPolicy?: SafePermissionPolicy;
 }
 
 const NO_COORDINATOR = { error: "no coordinator configured" };
@@ -85,7 +97,21 @@ const json = (v: unknown, status = 200) =>
   new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 
 export function startHttp(d: HttpDeps) {
+  const resumer = new SessionResumer(d.registry, d.bridge);
   const sockets = new Set<any>();
+  const push = d.push;
+  const needsYou = () => needsYouItems({ attention: d.attention.open(), coordinator: d.coordinator?.state() ?? null, tasks: d.coordination.snapshot().tasks, sessions: Object.fromEntries(d.registry.sessions) });
+  let stopped = false;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  const refreshPush = () => {
+    if (!push || stopped) return;
+    refreshTimer ??= setTimeout(() => { refreshTimer = null; void push.sync(needsYou()); }, 100);
+    refreshTimer.unref?.();
+  };
+  // Retries network failures and also reconciles when no browser is connected.
+  const pushSweep = setInterval(refreshPush, 30_000);
+  pushSweep.unref?.();
+  refreshPush();
   const auth = new Auth(d.store, d.token, d.coordinatorToken);
   /** Close UI sockets whose browser session matches (sid null = root-token socket). */
   const closeSockets = (match: (sid: string | null) => boolean) => {
@@ -99,6 +125,7 @@ export function startHttp(d: HttpDeps) {
   const expirySweep = setInterval(() => closeSockets((sid) => sid !== null && !auth.sessionHashOk(sid)), 30_000);
   expirySweep.unref?.();
   d.registry.onPush((m) => {
+    refreshPush();
     const s = JSON.stringify(m);
     for (const ws of sockets) ws.send(s);
   });
@@ -188,6 +215,23 @@ export function startHttp(d: HttpDeps) {
 
   async function api(req: Request, url: URL, srv: any, who: Principal): Promise<Response | undefined> {
     const parts = url.pathname.split("/").filter(Boolean); // ["api", ...]
+    if (parts[1] === "needs-you" && req.method === "GET") return json(needsYou().map(({ id }) => id));
+    if (parts[1] === "push") {
+      if (!push) return json({ error: "Push notifications unavailable" }, 503);
+      if (req.method === "GET" && parts[2] === "key") return json({ publicKey: push.publicKey });
+      if (req.method === "POST") {
+        try {
+          const body = await req.json();
+          if (parts[2] === "subscribe") {
+            push.subscribe(body, who === "browser" ? auth.sessionHash(req) : null);
+            refreshPush();
+          } else if (parts[2] === "unsubscribe" && typeof body.endpoint === "string") push.unsubscribe(body.endpoint);
+          else return json({ error: "unknown push action" }, 400);
+          return json({ ok: true });
+        } catch { return json({ error: "Invalid push subscription" }, 400); }
+      }
+      return json({ error: "not found" }, 404);
+    }
     if (req.method === "POST") {
       // Only the root token (the CLI) mints login links; a browser session can't extend itself.
       if (parts[1] === "login-code") {
@@ -205,12 +249,14 @@ export function startHttp(d: HttpDeps) {
         if (secret) {
           // Revoke first, unconditionally; then close any sockets that session still has open.
           const hash = auth.logout(secret);
+          push?.revoke(hash);
           closeSockets((sid) => sid === hash);
         }
         return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json", "set-cookie": clearedCookie() } });
       }
       if (parts[1] === "auth" && parts[2] === "revoke-all") {
         const revoked = auth.revokeAll();
+        push?.revoke();
         closeSockets((sid) => sid !== null);
         return json({ ok: true, revoked });
       }
@@ -222,7 +268,6 @@ export function startHttp(d: HttpDeps) {
           const out = preToolUse(payload, d.registry, d.coordination, []);
           return out ? json(out) : new Response("", { status: 200 });
         }
-        handleHook(parts[2], parts[3], payload, d.registry, d.attention);
         // The blocking variant (scripts/sb-permission.sh): decide, or hold for the human, then
         // answer the hook. An empty reply lets the session's own terminal dialog appear.
         if (parts[2] === "claude" && parts[3] === "PermissionRequest" && url.searchParams.get("wait") === "1" && d.permissions && typeof payload.session_id === "string") {
@@ -238,6 +283,7 @@ export function startHttp(d: HttpDeps) {
           );
           return out ? json(out) : new Response("", { status: 200 });
         }
+        handleHook(parts[2], parts[3], payload, d.registry, d.attention);
         return json({ ok: true });
       }
       if (parts[1] === "uploads" && parts.length === 2) {
@@ -248,9 +294,11 @@ export function startHttp(d: HttpDeps) {
           return json({ error: (e as Error).message }, 400);
         }
       }
-      if (parts[1] === "sessions" && parts.length === 4 && parts[3] === "end") {
+      if (parts[1] === "sessions" && parts.length === 4 && ["end", "resume"].includes(parts[3])) {
         try {
-          const r = await d.messenger.end(decodeURIComponent(parts[2]));
+          srv.timeout(req, 60);
+          const id = decodeURIComponent(parts[2]);
+          const r = parts[3] === "end" ? await d.messenger.end(id) : await resumer.resume(id);
           return json(r, r.ok ? 200 : 409);
         } catch (e) {
           if (e instanceof SendError) return json({ error: e.message }, e.status);
@@ -263,6 +311,7 @@ export function startHttp(d: HttpDeps) {
           if (parts[3] === "interrupt") return json(await d.messenger.interrupt(sessionId));
           const body = (await req.json().catch(() => null)) as any;
           if (!body || typeof body.text !== "string") return json({ error: "text required" }, 400);
+          d.coordinator?.onHumanTyping(sessionId);
           const m = await d.messenger.send({
             sessionId,
             text: body.text,
@@ -284,6 +333,7 @@ export function startHttp(d: HttpDeps) {
         if (!d.registry.sessions.has(sid)) return json({ error: "not found" }, 404);
         if (parts[3] === "typing") {
           d.auto.noteTyping(sid);
+          d.coordinator?.onHumanTyping(sid);
           return json({ ok: true });
         }
         if (parts[3] === "auto-cancel") return json({ ok: d.auto.cancel(sid, "cancelled by you") });
@@ -351,10 +401,36 @@ export function startHttp(d: HttpDeps) {
         if (parts[2] === "tool" && parts[3] === "get_updates") srv.timeout(req, 0);
         const body = ((await req.json().catch(() => null)) ?? {}) as any;
         try {
+          if (parts[2] === "usage-recommendations") {
+            if (who !== "browser") return json({ error: "Usage settings require the user's browser session" }, 403);
+            return json(co.setUsageRecommendationSettings(body));
+          }
+          if (parts[2] === "runtime") {
+            if (co.kind !== "builtin") return json({ error: "only the built-in coordinator has runtime settings" }, 409);
+            saveRuntimeSelection(body, d.coordinatorConfigDir);
+            return json(readRuntimeSettings(co.runtime?.running ? co.runtime.selection ?? null : null, d.coordinatorConfigDir));
+          }
+          if (parts[2] === "restart") {
+            co.restartRuntime();
+            return json(readRuntimeSettings(co.runtime?.selection ?? null, d.coordinatorConfigDir));
+          }
+          // Workers/scripts use the root bearer; it is not a human memory-write credential.
+          // The user edits through an authenticated browser; MCP writes need the coordinator token.
+          if (parts[2] === "memory") {
+            if (who !== "browser") return json({ error: "Memory edits require the user's browser session" }, 403);
+            if (parts.length === 3) return json(co.rememberLesson({ ...body, source: body.source || "user: Settings", reason: "User edited Coordinator memory in Settings" }, "user"));
+            if (parts.length === 5 && parts[4] === "delete") return json({ forgotten: co.memory.forget(decodeURIComponent(parts[3]), "user") });
+            if (parts.length === 5 && parts[4] === "keep") return json(co.memory.keep(decodeURIComponent(parts[3]), "user", { text: body?.text, updatedAt: body?.updatedAt }));
+            return json({ error: "not found" }, 404);
+          }
+          if (parts[2] === "tool" && ["remember", "forget"].includes(decodeURIComponent(parts[3] ?? "")) && who !== "coordinator")
+            return json({ error: "Memory tools require the coordinator credential; users edit memory in Settings" }, 403);
           if (parts[2] === "mode") return co.setMode(body.mode), json(co.state());
+          if (parts[2] === "auto-end") return co.setAutoEndSettings(body), json(co.state());
           if (parts[2] === "chat") {
             const images = Array.isArray(body.images) ? body.images.filter((p: unknown): p is string => typeof p === "string" && d.uploads.owns(p)) : [];
-            const r = co.userChat(String(body.text ?? ""), images);
+            // pasted: the box held pasted text, so the message can't serve as the coordinator's userChat.
+            const r = co.userChat(String(body.text ?? ""), images, { pasted: body.pasted === true });
             return json(r, r.ok ? 200 : 409);
           }
           // POST /api/coordinator/plans/:proposalId/tasks/:key/retry (you, not the coordinator's token)
@@ -398,6 +474,31 @@ export function startHttp(d: HttpDeps) {
             d.coordinator?.onHumanTaskEdit(t, prevOwner);
             return json(t);
           }
+          if (parts[1] === "tasks" && parts.length === 4 && parts[3] === "feedback" && req.method === "POST") {
+            // Commit and broadcast the review before waiting on any worker transport.
+            const t = c.rejectTaskWithFeedback(parts[2], body.note, "human");
+            const note = t.feedback!.at(-1)!.note;
+            d.coordinator?.onHumanTaskFeedback(t);
+            const worker = t.owner ? d.registry.sessions.get(t.owner) : undefined;
+            let message;
+            let failure = "The task's worker has ended or is missing.";
+            if (worker && worker.execution !== "ended") {
+              try {
+                message = await d.messenger.send({ sessionId: worker.id, author: "human", text: `Task ${t.id} (${t.title}) isn't done yet. Feedback from the user:\n\n${note}` });
+                if (!["failed", "uncertain"].includes(message.state)) {
+                  d.coordinator?.onHumanTyping(worker.id);
+                  return json(t);
+                }
+                failure = `Feedback delivery is ${message.state} (outbox #${message.id}). ${message.error ?? ""}`;
+              } catch (e) { failure = `The worker could not take the feedback: ${(e as Error).message}`; }
+            }
+            d.coordinator?.enqueue({
+              kind: "task_rejected_with_feedback", sessionId: null,
+              data: { taskId: t.id, note, ...(message ? { outboxId: message.id, deliveryState: message.state } : {}) },
+              text: `The user sent task ${t.id} (${t.title}) back to in_progress with feedback:\n${note}\n${failure} Inspect the task and worker; decide whether to resume or relaunch it, or route the note to a follow-up task. If delivery is uncertain, inspect the outbox and session before sending it again.`,
+            });
+            return json(t);
+          }
           // p1/fixes — human-only launch reservation inspection and recovery.
           if (parts[1] === "tasks" && parts[3] === "reservation" && parts[4] === "clear" && req.method === "POST") {
             const as = body.as,
@@ -416,6 +517,12 @@ export function startHttp(d: HttpDeps) {
       }
       // end p1/authority
 
+      if (parts[1] === "settings" && parts[2] === "permissions" && parts.length === 3) {
+        if (!d.permissionPolicy) return json({ error: "permission policy unavailable" }, 503);
+        const body = await req.json().catch(() => null);
+        if (!body || typeof body.autoApproveSafe !== "boolean" || Object.keys(body).length !== 1) return json({ error: "autoApproveSafe must be a boolean" }, 400);
+        return json(d.permissionPolicy.setEnabled(body.autoApproveSafe));
+      }
       if (parts[1] === "governor") {
         const body = ((await req.json().catch(() => null)) ?? {}) as any;
         const g = d.governor;
@@ -446,6 +553,39 @@ export function startHttp(d: HttpDeps) {
         if (!item || item.status !== "open") return json({ error: "not an open item" }, 404);
         if (item.kind !== "approval" || typeof item.meta.answerKey !== "string") return json({ error: "this approval can only be answered in its session" }, 409);
         if (!["accept", "acceptForSession", "decline", "cancel"].includes(decision)) return json({ error: "bad decision" }, 400);
+        if (item.meta.answerKey.startsWith("tool-denial:") && item.meta.deniedToolCall) {
+          if (decision !== "accept" && decision !== "decline") return json({ error: "choose Allow or Deny for this exact call" }, 400);
+          try {
+            const automatic = item.meta.autoFingerprint && typeof item.meta.replyOutboxId === "number" ? d.store.outboxById(item.meta.replyOutboxId) : null;
+            if (automatic && automatic.author === "auto" && automatic.state !== "failed") return json({ error: "The automatic retry may already have been delivered. Resolve its delivery in the session before retrying.", outboxId: automatic.id }, 409);
+            let attempt = typeof item.meta.replyAttempt === "number" ? item.meta.replyAttempt : 0;
+            const key = () => `tool-denial-reply:${item.id}:${attempt}`;
+            // Only a provably failed delivery can be retried. Competing decisions share a key,
+            // so Messenger rejects them instead of sending both Allow and Deny.
+            if (d.store.outboxByClientId(key())?.state === "failed") {
+              attempt++;
+              d.attention.annotate(item.id, { replyAttempt: attempt });
+            }
+            const message = await d.messenger.send({ sessionId: item.sessionId, author: "human", clientId: key(), text: deniedCallReply(item.meta.deniedToolCall as DeniedToolCall, decision === "accept") });
+            d.attention.annotate(item.id, { replyOutboxId: message.id });
+            d.attention.onDelivery(d.store.outboxById(message.id) ?? message);
+            if (message.state === "failed" || message.state === "uncertain") return json({ error: message.error ?? "The reply is not confirmed. Check its delivery in the session before retrying.", outboxId: message.id }, 409);
+            return json({ ok: true });
+          } catch (e) {
+            return json({ error: (e as Error).message }, e instanceof SendError ? e.status : 409);
+          }
+        }
+        // AskUserQuestion held by the hook: {decision: "accept", answers: {question: answer}} sends the
+        // answers to the session; decline tells it you didn't answer here.
+        if (Array.isArray(item.meta.questions) && item.meta.answerKey.startsWith("claude-hook:") && (decision === "accept" || decision === "acceptForSession")) {
+          try {
+            if (!d.permissions?.answerQuestions(item.meta.answerKey, body?.answers)) return json({ error: "that question is no longer waiting here: answer it in the session" }, 409);
+          } catch (e) {
+            return json({ error: (e as Error).message }, 400);
+          }
+          d.attention.markAnsweredHere(item.id);
+          return json({ ok: true });
+        }
         // A Claude prompt held by the PermissionRequest hook: the answer goes back through the hook.
         if (item.meta.answerKey.startsWith("claude-hook:")) {
           if (!d.permissions?.answer(item.meta.answerKey, decision)) return json({ error: "that prompt is no longer waiting here: answer it in the session" }, 409);
@@ -507,14 +647,30 @@ export function startHttp(d: HttpDeps) {
     if (parts[1] === "tasks" && parts.length === 4 && parts[3] === "reservation") return json({ reservation: d.coordination.reservation(parts[2]) });
     if (parts[1] === "coordinator") {
       if (!d.coordinator) return json(NO_COORDINATOR, 404);
+      if (parts[2] === "usage-recommendations") return json(d.coordinator.usageRecommendationSettings());
+      if (parts[2] === "runtime") return json(readRuntimeSettings(d.coordinator.runtime?.running ? d.coordinator.runtime.selection ?? null : null, d.coordinatorConfigDir));
+      if (parts[2] === "memory" && parts.length === 3) return json(d.coordinator.memory.snapshot());
       if (parts[2] === "tools") return json(d.coordinator.tools());
       if (!parts[2]) return json(d.coordinator.state());
     }
+    if (parts[1] === "settings" && parts[2] === "permissions" && parts.length === 3) return d.permissionPolicy ? json(d.permissionPolicy.snapshot()) : json({ error: "permission policy unavailable" }, 503);
     if (parts[1] === "governor") return json(d.governor.snapshot());
+    if (parts[1] === "usage") return json(d.usage.snapshot());
     return json({ error: "not found" }, 404);
   }
 
-  return { server, broadcast: (m: ServerPush) => sockets.forEach((ws) => ws.send(JSON.stringify(m))) };
+  const stop = server.stop.bind(server);
+  server.stop = (closeActiveConnections) => {
+    stopped = true;
+    clearInterval(pushSweep);
+    clearInterval(expirySweep);
+    if (refreshTimer) clearTimeout(refreshTimer);
+    return stop(closeActiveConnections);
+  };
+  return { server, broadcast: (m: ServerPush) => {
+    refreshPush();
+    sockets.forEach((ws) => ws.send(JSON.stringify(m)));
+  } };
 }
 
 // Defense in depth for the UI: even if transcript HTML slipped past sanitization, no

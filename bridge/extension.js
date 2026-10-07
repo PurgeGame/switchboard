@@ -1,5 +1,6 @@
 // Switchboard Bridge: reports this window's terminals to the local Switchboard daemon and
 // performs the few terminal actions it asks for (send text, show, create).
+// Managed launches have a dedicated process, not an interactive shell left behind on exit.
 //
 // Transport: newline-delimited JSON over the unix socket
 // ~/.local/share/switchboard/bridge.sock. Before connecting, the extension checks that the
@@ -27,10 +28,18 @@ const byId = new Map(); // id -> Terminal
 const windowId = crypto.randomUUID();
 let seq = 0;
 
+function managedId(t) {
+  const o = t.creationOptions;
+  const id = o && o.env && o.env.SWITCHBOARD_TERMINAL_ID;
+  return typeof id === "string" && /^[0-9a-f-]{36}$/.test(id) &&
+    Array.isArray(o.shellArgs) && o.shellArgs[1] === id ? id : null;
+}
+
 function idOf(t) {
   let id = ids.get(t);
   if (!id) {
-    id = `${windowId.slice(0, 8)}-${++seq}`;
+    const managed = managedId(t);
+    id = managed ? `managed-${managed}` : `${windowId.slice(0, 8)}-${++seq}`;
     ids.set(t, id);
   }
   byId.set(id, t);
@@ -60,7 +69,7 @@ async function terminalsSnapshot() {
     try {
       pid = (await t.processId) ?? null;
     } catch {}
-    out.push({ id: idOf(t), name: t.name, processId: pid });
+    out.push({ id: idOf(t), name: t.name, processId: pid, launchId: managedId(t) });
   }
   return out;
 }
@@ -94,6 +103,33 @@ async function handle(msg) {
       scheduleReport();
       return reply(true, { terminalId: idOf(t), processId: pid ?? null });
     }
+    if (msg.type === "createManaged") {
+      if (process.platform !== "linux" || !/^[0-9a-f-]{36}$/.test(msg.launchId) ||
+          typeof msg.runtime !== "string" || !path.isAbsolute(msg.runtime) ||
+          typeof msg.runner !== "string" || !path.isAbsolute(msg.runner) ||
+          typeof msg.command !== "string" || !msg.command) return reply(false, null, "invalid managed terminal launch");
+      // Retransmission/reconnect attaches to the same launch, never creates a second tab.
+      const matches = vscode.window.terminals.filter((t) => managedId(t) === msg.launchId);
+      if (matches.length > 1) return reply(false, null, "ambiguous managed terminal ownership");
+      if (matches.length) {
+        const existing = matches[0].creationOptions;
+        if (existing.shellPath !== msg.runtime || existing.shellArgs[0] !== msg.runner ||
+            existing.shellArgs[2] !== msg.command || existing.cwd !== msg.cwd || matches[0].exitStatus !== undefined) {
+          return reply(false, null, "managed launch identity changed or already exited");
+        }
+      }
+      const t = matches[0] || vscode.window.createTerminal({
+        name: String(msg.name), cwd: String(msg.cwd), shellPath: msg.runtime,
+        shellArgs: [msg.runner, msg.launchId, msg.command],
+        env: { SWITCHBOARD_TERMINAL_ID: msg.launchId },
+        // Keep normal persistence: reload/reconnect must not end a live agent.
+        isTransient: false,
+      });
+      t.show(false);
+      const pid = await t.processId;
+      scheduleReport();
+      return reply(true, { terminalId: idOf(t), processId: pid ?? null, launchId: msg.launchId });
+    }
     if (msg.type === "ping") return reply(true);
     reply(false, null, `unknown request ${msg.type}`);
   } catch (e) {
@@ -115,6 +151,7 @@ function connect() {
       extensionHostPid: process.pid,
       workspaceFolders: (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath),
       vscodeVersion: vscode.version,
+      capabilities: process.platform === "linux" ? ["managed-terminal-v1"] : [],
     });
     send({ type: "terminals", terminals: await terminalsSnapshot() });
   });

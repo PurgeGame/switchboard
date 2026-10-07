@@ -17,7 +17,7 @@ export interface TierSuggestion {
 const DEEP_TEXT: [RegExp, string][] = [
   [/\bsmart[- ]?contracts?\b|\bsolidity\b|\.sol\b|\bon[- ]chain\b/i, "smart contracts"],
   [/\bsecurity\b|\bvulnerab|\bexploit|\baudit\b|\bxss\b|\bcsrf\b|\binjection\b|\bsandbox(ing)? escape/i, "security"],
-  [/\bfunds?\b|\bpayments?\b|\bwallet|\btreasury\b|\bwithdraw|\bdeposit|\btoken(omics)?\b|\bbilling\b/i, "touches funds"],
+  [/\bmoney\b|\bfinancial\b|\bfunds?\b|\bpayments?\b|\bwallet|\btreasury\b|\bwithdraw|\bdeposit|\btoken(omics)?\b|\bbilling\b/i, "touches funds"],
   [/\bauth(entication|orization|n|z)?\b|\blogin\b|\bpermissions?\b|\baccess control\b|\bsessions? tokens?\b|\boauth\b|\bpasswords?\b/i, "auth"],
   [/\bcrypto(graph\w*)?\b|\bsignatures?\b|\bencrypt|\bdecrypt|\bhash(ing)?\b|\bnonce\b|\bkeys? (management|derivation)\b|\brng\b|\brandomness\b/i, "cryptography"],
   [/\bgame[- ]theor|\bmechanism design\b|\beconomic|\bincentive|\btokenomics\b/i, "game theory / economics"],
@@ -27,7 +27,8 @@ const DEEP_TEXT: [RegExp, string][] = [
 const DEEP_PATH: [RegExp, string][] = [
   [/(^|\/)contracts\//i, "path under contracts/"],
   [/\.sol$/i, "Solidity file"],
-  [/(^|\/)(auth|security|crypto)(\/|$)/i, "security-sensitive path"],
+  [/(^|\/)(auth|security|crypto)([./_-]|$)/i, "security-sensitive path"],
+  [/(^|\/)(money|payments?|billing|wallet|funds|treasury)([./_-]|$)/i, "money-sensitive path"],
 ];
 
 const LIGHT_TEXT =

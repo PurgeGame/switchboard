@@ -5,7 +5,10 @@ import { ClaudeAdapter } from "./adapters/claude.ts";
 import { CodexAdapter } from "./adapters/codex.ts";
 import { ScannerAdapter } from "./adapters/scanner.ts";
 import { loadConfig, loadToken, paths, rotateCoordinatorToken } from "./config.ts";
-import { judgeWithModel, PermissionBroker, type PermissionInfo } from "./permissions.ts";
+import { PermissionBroker, type PermissionInfo } from "./permissions.ts";
+import { retrySafeDenial } from "./permission-retry.ts";
+import { SafePermissionPolicy, deniedPermissionInfo, codexApprovalInput, inOwnWorktree } from "./permission-policy.ts";
+import { deniedCallText, type DeniedToolCall } from "./adapters/tool-denial.ts";
 import { Store } from "./db.ts";
 import { startHttp } from "./http.ts";
 import { Registry } from "./registry.ts";
@@ -13,6 +16,7 @@ import { SystemMonitor } from "./system.ts";
 import type { SystemStats } from "../shared/types.ts";
 import { AttentionEngine } from "./attention.ts";
 import { AmbiguityResolver, haikuIsQuestion } from "./classify.ts";
+import { NeedsYouPush } from "./push.ts";
 import { Notifier } from "./notify.ts";
 import { CodexLive } from "./adapters/codex-live.ts";
 import { Messenger } from "./messaging.ts";
@@ -22,10 +26,14 @@ import { CompositeTerminal, TmuxSender } from "./tmux.ts";
 import { AUTO_TEMPLATE, AutoContinuer } from "./autocontinue.ts";
 import { Perspectives } from "./perspectives.ts";
 import { Coordination } from "./coordination.ts";
+import { UsageMonitor, claudeCredentialsSource } from "./usage.ts";
+import { usageCache } from "./usage-cache.ts";
 import { Governor, defaultGovernorConfig } from "./governor.ts";
-import { CoordinatorAgent, permissionJudgeGate } from "./coordinator/agent.ts";
+import { CoordinatorAgent } from "./coordinator/agent.ts";
 import { loadCoordinatorConfig } from "./coordinator/config.ts";
-import { ClaudeRuntime } from "./coordinator/runtime.ts";
+import { inputBlocker, processBlocker, worktreeState } from "./coordinator/auto-end.ts";
+import { pinCodexWorkers } from "./codex-pins.ts";
+import { CoordinatorRuntime } from "./coordinator/runtime.ts";
 import { TOOL_NAMES } from "./coordinator/tools.ts";
 import { createWorktree } from "./coordinator/worktree.ts";
 
@@ -59,8 +67,14 @@ const attention = new AttentionEngine(
     questionRaised: (item) =>
       void auto.onQuestion(item).then((r) => {
         if (r !== "pending") notifyItem(item.id, item.sessionId);
-      }),
+      }).catch(() => notifyItem(item.id, item.sessionId)),
     stoppedShort: (s, text, meta) => void auto.onStoppedShort(s.id, text, meta),
+    classifyDenial: (s, call) => permissionPolicy.decide(deniedPermissionInfo(s.id, s.provider === "codex" ? "codex" : "claude", call)),
+    retryDenied: (s, item) => {
+      const call = item.meta.deniedToolCall as DeniedToolCall;
+      coordinator?.log("permission_auto_approval", "ok", deniedCallText(call), { sessionId: s.id, reason: String(item.meta.autoRule) });
+      void retrySafeDenial(store, attention, messenger, s, item);
+    },
   },
   new AmbiguityResolver(cfg.modelClassifier ? haikuIsQuestion : null),
 );
@@ -69,7 +83,10 @@ registry.attention = attention;
 const uploads = new Uploads(paths.dataDir);
 uploads.prune(30 * 24 * 3600_000);
 const codexLive = new CodexLive(codex.daemon);
-const messenger = new Messenger(store, registry, codexLive, uploads, (message) => broadcast({ type: "outbox", message }));
+const messenger = new Messenger(store, registry, codexLive, uploads, (message) => {
+  broadcast({ type: "outbox", message });
+  attention.onDelivery(message);
+});
 import { defaultHookPaths as _hp, hooksInstalled as _hi } from "../cli/hooks.ts";
 const hooksActive = (() => {
   try {
@@ -155,6 +172,9 @@ registry.eventHooks.push((e) => perspectives.onEvent(e));
 bgPerspectives = perspectives;
 
 const coordination = new Coordination(store);
+messenger.onEnded = (id) => {
+  return coordinator ? coordinator.onSessionClosed(id) : coordination.releaseSessionClaims(id);
+};
 coordination.groupOf = (sid) => perspectives.list().find((g) => g.status !== "suggested" && g.members.some((m) => m.sessionId === sid))?.id ?? null;
 let coordTimer: ReturnType<typeof setTimeout> | null = null;
 coordination.onChange = () => {
@@ -181,6 +201,9 @@ const governor = new Governor(
 governor.onChange = () => broadcast({ type: "governor", ...governor.snapshot() } as any);
 (globalThis as any).sbGovernor = governor; // the coordinator's MCP tools look it up
 
+const usage = new UsageMonitor({ claudeSource: cfg.usage?.claudeOAuth === true ? claudeCredentialsSource() : null, cache: usageCache(store.db) });
+usage.onChange = (u) => broadcast({ type: "usage", usage: u });
+
 // ---- coordinator agent (Phase 6): starts in manual (off) until the user switches it on.
 // coordinator.agent (D34): "builtin" = the engine plus the daemon's own Claude process; "external" =
 // the engine only, driven by the user's own agent through `sb mcp`; "none" = no coordinator at all.
@@ -205,6 +228,7 @@ const coord = coordKind === "none" ? null : new CoordinatorAgent({
   askSeveral: (prompt, cwd, members) =>
     perspectives.create(prompt, [], cwd, members.map((m) => ({ kind: "new" as const, provider: m.provider, model: m.model })), { autoSynthesize: true, background: true }),
   group: (id) => perspectives.get(id),
+  groups: () => perspectives.list(),
   // Context maintenance: a native compact for Codex on its daemon; for Claude, the exact command
   // typed into its terminal (slash commands only work as typed input). Rechecked at delivery.
   maintain: async (sessionId, command, focus, ctx) => {
@@ -240,8 +264,14 @@ const coord = coordKind === "none" ? null : new CoordinatorAgent({
     return id;
   },
   createWorktree: (repo, slug, repoId) => createWorktree(coordCfg.worktreeRoot, repo, slug, repoId),
+  // close_session: the same way you end a session from its pane.
+  end: (sessionId, guard) => messenger.end(sessionId, guard).catch((e) => ({ ok: false, error: (e as Error).message })),
+  autoEndBlocker: (s) => inputBlocker(store, s.id) ?? processBlocker(s, codex.daemonPid),
+  worktreeState,
   escalate: (sid, title, text) => attention.raiseEscalation(sid ? (registry.sessions.get(sid) ?? null) : null, title, text),
+  reportStall: (sid, checkId, status, reason, action) => registry.reportStall(sid, checkId, status, reason, action),
   governor,
+  usage: () => usage.snapshot(),
   push: (st) => broadcast({ type: "coordinator", ...st }),
 });
 if (coord) {
@@ -250,11 +280,26 @@ if (coord) {
   // (with no coordinator, no coordinator-authored message can exist; your own sends need no hook).
   messenger.authorize = (m) => coord.authorizeDelivery(m.sessionId, m.text, m.context);
   // External: no model process, ever. Your agent drives the same engine through `sb mcp`.
-  if (coordKind === "builtin") coord.setRuntime(new ClaudeRuntime(() => coordCfg.model, TOOL_NAMES, cfg.port, () => coordCfg.effort ?? null));
+  if (coordKind === "builtin") coord.setRuntime(new CoordinatorRuntime(loadCoordinatorConfig, TOOL_NAMES, cfg.port));
   coordinator = coord;
   registry.eventHooks.push((e) => coord.onEvent(e));
+  registry.stallHooks.push((s, check) => coord.onStallSuspected(s, check));
+  registry.execHooks.push((s) => coord.onSessionExecution(s));
+  // A worker ending frees a launch slot: queued plan tasks launch then, not at the next heartbeat.
+  registry.execHooks.push((s) => s.execution === "ended" && coord.onSessionEnded(s.id));
+  // A session showing up in an uncertain launch's folder may be its worker (a late Codex thread).
+  registry.execHooks.push((s) => coord.linkWorker(s));
 }
 console.log(`coordinator: ${coordKind}`);
+// Codex workers it launched, pinned to their process, so they can be ended like any session.
+if (coord)
+  setInterval(() => {
+    try {
+      pinCodexWorkers({ terminals: () => bridge.launchedTerminals(), sessions: () => registry.sessions.values(), taskOf: (id) => coord.launchedTask(id), pin: (t, pid, st) => codex.pin(t, pid, st) });
+    } catch (e) {
+      console.error("[codex-pins]", e);
+    }
+  }, 15_000);
 
 /** Periodic jobs must never take the daemon down. */
 const every = (ms: number, name: string, fn: () => void) =>
@@ -275,38 +320,51 @@ every(5_000, "governor", () => {
   if (system) system.gameMode = governor.gameMode;
 });
 
+every(30_000, "usage", () => usage.refresh());
+void usage.refresh();
+
 // Codex approvals reach us only on threads we subscribed to; they carry the full request.
-// Permission prompts: the coordinator approves what's reasonable (D29); the rest come to you.
-const userTextsOf = (id: string) =>
-  store
-    .events(id, { limit: 600 })
-    .filter((e) => e.type === "user_msg" && typeof e.data.text === "string" && e.data.text.trim() !== AUTO_TEMPLATE)
-    .map((e) => String(e.data.text))
-    .slice(-15);
+// The Settings policy is authoritative for both providers, even with the coordinator off.
+// D44: off unless switched on; when on, project-code execution only for coordinator workers in
+// their own worktree unless config says "all"; excluded sessions never.
+const launchedCwd = (sessionId: string) => coordination.reservations().find((r) => r.sessionId === sessionId)?.cwd ?? null;
+const permissionPolicy = new SafePermissionPolicy(store, (info) => {
+  const s = registry.sessions.get(info.sessionId);
+  return launchedCwd(info.sessionId) ?? s?.project ?? null;
+}, cfg.autoApproveSafePermissions ?? false, {
+  excluded: (sessionId) => coordinator?.authority(sessionId) === "excluded",
+  ownWorktree: (info) => inOwnWorktree(!!coordinator?.isLaunched(info.sessionId), coordination.reservations().find((r) => r.sessionId === info.sessionId && r.state === "launched"), info.cwd, coordCfg.worktreeRoot),
+});
 const permissions = new PermissionBroker({
+  checking: (id, checking) => attention.setPermissionChecking(id, checking),
   holdMs: () => (cfg.permissionHoldMinutes ?? 10) * 60_000,
-  // Only the built-in coordinator, switched on (none / external: every prompt comes to you).
-  mayJudge: permissionJudgeGate(coord),
-  // The project comes from what Switchboard knows about the session, never from the request
-  // (an agent can cd anywhere; that doesn't widen what it may touch).
-  roots: (info) => {
+  safeDecision: (info) => permissionPolicy.decide(info),
+  mayJudge: () => false,
+  roots: () => [],
+  judge: async () => null,
+  raise: (info, answerKey, recommendation, questions) => {
     const s = registry.sessions.get(info.sessionId);
-    return [s?.project ?? s?.cwd ?? null].filter((x): x is string => !!x);
-  },
-  judge: (info) => {
-    const s = registry.sessions.get(info.sessionId);
-    return judgeWithModel(coordCfg.model, info, { goal: s?.goal ?? s?.name ?? null, userTexts: userTextsOf(info.sessionId) });
-  },
-  raise: (info, answerKey, recommendation) => {
-    const s = registry.sessions.get(info.sessionId);
-    if (s) attention.raisePermission(s, { tool: info.tool, summary: info.summary, answerKey, recommendation });
+    // AskUserQuestion: the card shows the questions and their options, and takes the answers.
+    if (s) attention.raisePermission(s, { tool: info.tool, summary: JSON.stringify({ input: info.input, cwd: info.cwd }, null, 2), answerKey, recommendation, ...(questions ? { questions } : {}) });
   },
   settle: (key, how) => attention.settlePermission(key, how),
   logAuto: (info, v) => {
     const s = registry.sessions.get(info.sessionId);
-    if (s) attention.recordAutoApproval(s, { tool: info.tool, summary: info.summary, reason: v.reason, key: randomUUID() });
+    coordinator?.log("permission_auto_approval", "ok", JSON.stringify({ tool: info.tool, input: info.input, cwd: info.cwd }), { sessionId: info.sessionId, reason: v.rule ?? v.reason });
+    if (s) attention.recordAutoApproval(s, { tool: info.tool, summary: JSON.stringify({ tool: info.tool, input: info.input, cwd: info.cwd }), reason: v.reason, rule: v.rule, key: randomUUID() });
   },
 });
+
+// A crash between approval and sending must not silently hide an unconfirmed retry.
+for (const row of store.db.query("SELECT data FROM attention WHERE json_extract(data, '$.meta.retryPending')=1").all() as { data: string }[]) {
+  const item = JSON.parse(row.data);
+  const message = store.outboxByClientId(`tool-denial-auto:${item.id}`);
+  if (message) {
+    attention.annotate(item.id, { replyOutboxId: message.id });
+    attention.onDelivery(message);
+  }
+  if (!message || message.state !== "accepted") attention.retryFailed(item.id, "Automatic retry was interrupted. Check delivery in the session.");
+}
 
 codexLive.onApproval = (a) => {
   const sid = `codex:${a.threadId}`;
@@ -321,7 +379,7 @@ codexLive.onApproval = (a) => {
     sessionId: sid,
     provider: "codex",
     tool: isCommand ? "command" : isFiles ? "file change" : `codex ${a.method}`,
-    input: isCommand ? { command: a.rawCommand } : isFiles ? { paths: a.paths, grantRoot: a.grantRoot } : {},
+    input: isCommand ? codexApprovalInput(a.raw ?? {}, a.rawCommand) : isFiles ? { paths: a.paths, grantRoot: a.grantRoot } : {},
     summary,
     // Where Codex will run it; else the thread's cwd from Switchboard's record.
     cwd: a.cwd ?? s?.cwd ?? null,
@@ -333,20 +391,26 @@ codexLive.onApproval = (a) => {
         codexLive.answer(answerKey, "accept");
         return;
       } catch {
-        // No longer pending (answered in the terminal): nothing to do.
+        // A control-path conflict must still leave the pending prompt actionable.
+        if (codexLive.approvals.has(answerKey) && s) attention.raisePermission(s, { tool: info.tool, summary, answerKey, recommendation: "Automatic approval could not be delivered; choose Allow or Deny." });
         return;
       }
     }
-    attention.noteApproval(sid, { tool: a.kind, summary: recommendation ? `${summary}\nCoordinator: ${recommendation}` : summary, ts: a.ts, answerKey });
+    const fullCall = JSON.stringify({ command: a.rawCommand, cwd: info.cwd, reason: a.reason, request: a.raw }, null, 2);
+    attention.noteApproval(sid, { tool: a.kind, summary: fullCall, ts: a.ts, answerKey });
+    if (s) attention.raisePermission(s, { tool: a.kind, summary: fullCall, answerKey, recommendation });
   });
 };
+
+codexLive.onApprovalResolved = (_thread, key) => attention.settlePermission(key, "answered in the session");
 
 const monitor = new SystemMonitor();
 let system: SystemStats | null = null;
 
+const phonePush = new NeedsYouPush(store.db, cfg.push?.subject || "mailto:switchboard@localhost", undefined, { details: cfg.push?.details === true });
 let http;
 try {
-  http = startHttp({ port: cfg.port, remoteHost: cfg.remoteHost, token, coordinatorToken, registry, store, webDist: paths.webDist, system: () => system, attention, messenger, codexLive, uploads, bridge, auto, perspectives, coordination, governor, coordinator: coord ?? undefined, coordinatorAgent: coordKind, permissions });
+  http = startHttp({ port: cfg.port, remoteHost: cfg.remoteHost, token, coordinatorToken, registry, store, webDist: paths.webDist, system: () => system, attention, messenger, codexLive, uploads, bridge, auto, perspectives, coordination, governor, usage, coordinator: coord ?? undefined, coordinatorAgent: coordKind, permissions, permissionPolicy, push: phonePush });
   broadcast = http.broadcast;
 } catch (e) {
   console.error(`switchboardd: cannot listen on 127.0.0.1:${cfg.port} (${(e as Error).message}). Is another instance running?`);

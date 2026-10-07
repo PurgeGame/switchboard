@@ -71,8 +71,55 @@ test("pasted images go to the model as image blocks", () => {
   }
 });
 
-test("the coordinator runs on a strong model and thinks hard by default", () => {
+test("generic defaults: Claude Opus xhigh, $10 a day, 3 workers, 1 message per 10 min and 6 an hour per session", () => {
   const cfg = mergeCoordinatorConfig({});
+  expect(cfg.provider).toBe("claude");
   expect(cfg.model).toBe("opus");
   expect(cfg.effort).toBe("xhigh");
+  expect(cfg.codex).toEqual({ model: "gpt-6.1-sol", effort: "high" });
+  expect(cfg.limits).toMatchObject({ dailyBudgetUsd: 10, maxLaunched: 3, perSessionCooldownMs: 10 * 60_000, perSessionPerHour: 6 });
+  expect(cfg.tiers.deep).toEqual({ claude: { model: "opus", effort: "xhigh" }, codex: { model: "gpt-6-astra", effort: "xhigh" } });
+  expect(cfg.tiers.standard).toEqual({ claude: { model: "sonnet", effort: null }, codex: { model: "gpt-6.1-sol", effort: null } });
+  expect(cfg.tiers.light).toEqual({ claude: { model: "haiku", effort: null }, codex: { model: "gpt-6-luna", effort: null } });
+  expect(mergeCoordinatorConfig({ codex: { effort: "xhigh" } }).codex).toEqual({ model: "gpt-6.1-sol", effort: "xhigh" });
+});
+
+test("owner settings in config.json reproduce any previous behavior, including no per-time limits", () => {
+  const cfg = mergeCoordinatorConfig({
+    provider: "codex", model: "opus", effort: "medium", codex: { model: "gpt-6-astra", effort: "xhigh" },
+    limits: { perSessionCooldownMs: 0, perSessionPerHour: 0, maxLaunched: 10, dailyBudgetUsd: 50 },
+    tiers: { deep: { codex: { model: "gpt-6-astra", effort: "ultra" } }, light: { claude: { model: "sonnet" } } },
+  });
+  expect(cfg).toMatchObject({ provider: "codex", effort: "medium", codex: { model: "gpt-6-astra", effort: "xhigh" } });
+  expect(cfg.limits).toMatchObject({ perSessionCooldownMs: 0, perSessionPerHour: 0, maxLaunched: 10, dailyBudgetUsd: 50 });
+  expect(cfg.tiers.deep.codex).toEqual({ model: "gpt-6-astra", effort: "ultra" });
+  expect(cfg.tiers.light.claude).toEqual({ model: "sonnet", effort: null });
+});
+
+test("only an explicit 0 removes a message limit: missing, null, negative or non-numeric values keep the default", () => {
+  for (const bad of [null, "0", -1, Number.NaN, true, {}])
+    expect(mergeCoordinatorConfig({ limits: { perSessionPerHour: bad, perSessionCooldownMs: bad } }).limits).toMatchObject({ perSessionPerHour: 6, perSessionCooldownMs: 10 * 60_000 });
+  expect(mergeCoordinatorConfig({ limits: {} }).limits.perSessionPerHour).toBe(6);
+  expect(mergeCoordinatorConfig({ limits: { perSessionPerHour: 0 } }).limits.perSessionPerHour).toBe(0);
+});
+
+test("its replies keep their paragraphs and list lines (no wall of text)", async () => {
+  const x = rig();
+  x.agent.userChat("go over the limits");
+  const reply = "Here's what I see.\n\n**Coordinator**\n- Model: opus\n- Budget: $50 a day   \n\n\n\nThat's all.";
+  x.rt.onText(reply);
+  await x.agent.callTool("tell_user", { text: "Done.\n\n- one\n- two", reason: "r" });
+  const texts = x.agent.chat().filter((e) => e.role === "coordinator").map((e) => e.text);
+  expect(texts).toContain("Here's what I see.\n\n**Coordinator**\n- Model: opus\n- Budget: $50 a day\n\nThat's all.");
+  expect(texts).toContain("Done.\n\n- one\n- two");
+});
+
+test("get_state carries every setting that applies to it, and says only the user changes them", async () => {
+  const x = rig();
+  const r = await x.agent.callTool("get_state", {});
+  const s = (r as any).result.settings;
+  expect(s.limits.maxLaunched).toBeNumber();
+  expect(s.tiers.standard.claude.model).toBeString();
+  expect(s.coordinator.model).toBeString();
+  expect(s.whoChanges).toContain("Only the user");
 });

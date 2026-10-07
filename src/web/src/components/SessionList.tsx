@@ -3,13 +3,13 @@ import type { AttentionItem, Session } from "../../../shared/types.ts";
 import type { ListModel } from "../sessionList.ts";
 import { baseName, shortPath } from "../format.ts";
 import {
-  isUnread,
   selectSession,
   setGroupFilter,
   setProviderFilter,
   setSearch,
   toggleBackground,
   toggleEnded,
+  toggleFolder,
   useNow,
   useStore,
   COORDINATOR_ID,
@@ -17,8 +17,9 @@ import {
   type GroupFilter,
   type ProviderFilter,
 } from "../store.ts";
-import { STATUS_GROUPS } from "../status.ts";
-import { Chevron, SearchIcon } from "./Icons.tsx";
+import { sessionTitle, STATUS, STATUS_GROUPS } from "../status.ts";
+import { isUnread, stateSummary } from "../sessionList.ts";
+import { Chevron, SearchIcon, StatusIcon } from "./Icons.tsx";
 import { Launcher } from "./Launcher.tsx";
 import { homeRow } from "../home.ts";
 import { SessionRow } from "./SessionRow.tsx";
@@ -33,7 +34,7 @@ const PROVIDERS: { id: ProviderFilter; label: string }[] = [
 function Segmented<T extends string>(props: {
   label: string;
   value: T;
-  options: { id: T; label: string }[];
+  options: { id: T; label: string; count?: number }[];
   onChange: (v: T) => void;
 }) {
   return (
@@ -48,6 +49,7 @@ function Segmented<T extends string>(props: {
           }`}
         >
           {o.label}
+          {o.count !== undefined && <> <span className="tabular-nums">{o.count}</span></>}
         </button>
       ))}
     </div>
@@ -58,6 +60,7 @@ const GROUP_OPTIONS: { id: GroupFilter; label: string }[] = [
   { id: "all", label: "All" },
   { id: "attention", label: "Needs you" },
   { id: "active", label: "Working" },
+  { id: "unread", label: "Active" },
 ];
 
 /**
@@ -79,7 +82,7 @@ function HomeRow({ selected }: { selected: boolean }) {
       className={`relative flex w-full items-center gap-2.5 border-b border-line py-2.5 pl-4 pr-3 text-left ${selected ? "bg-raised" : "hover:bg-hover"}`}
     >
       <span aria-hidden className={`absolute bottom-1.5 left-0 top-1.5 w-[3px] rounded-r ${waiting ? "bg-amber" : selected ? "bg-focus" : "bg-transparent"}`} />
-      <span aria-hidden className={`h-2.5 w-2.5 shrink-0 rounded-full ${lamp === "busy" ? "lamp-pulse bg-blue" : lamp === "on" ? "bg-green" : "bg-line-strong"}`} />
+      <span aria-hidden className={`h-2.5 w-2.5 shrink-0 rounded-full ${lamp === "busy" ? "bg-blue" : lamp === "on" ? "bg-green" : "bg-line-strong"}`} />
       <span className="min-w-0 flex-1">
         <span className="block truncate text-[13px] font-semibold">{title}</span>
         <span className="block truncate text-[11px] text-ink-3">{waiting ? (
@@ -99,13 +102,33 @@ function HomeRow({ selected }: { selected: boolean }) {
   );
 }
 
-function ProjectHeading({ path, count }: { path: string; count: number }) {
+/** What's in a group, at a glance: one icon per state, with how many, most urgent first. */
+function StateSummary({ sessions }: { sessions: Session[] }) {
+  const summary = stateSummary(sessions);
   return (
-    <div className="sticky top-0 z-10 flex items-baseline gap-2 border-y border-line bg-panel/95 px-3 py-1 backdrop-blur" title={path}>
-      <span className="truncate text-[12px] font-semibold text-ink-2">{path.startsWith("/") ? baseName(path) : path}</span>
-      <span className="flex-1" />
-      <span className="text-[11px] text-ink-3">{count}</span>
-    </div>
+    <span className="flex shrink-0 items-center gap-2 text-[11px]" aria-label={summary.map((x) => `${x.count} ${x.label.toLowerCase()}`).join(", ")}>
+      {summary.map((x) => (
+        <span key={x.execution} title={`${x.count} ${x.label.toLowerCase()}`} className={`tone-${STATUS[x.execution].tone} inline-flex items-center gap-0.5 text-(--tone)`}>
+          <StatusIcon name={STATUS[x.execution].icon} width={11} height={11} />
+          <span className="tabular-nums">{x.count}</span>
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function ProjectHeading({ path, sessions, open, onToggle }: { path: string; sessions: Session[]; open: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      aria-expanded={open}
+      className="sticky top-0 z-10 flex w-full items-center gap-2 border-y border-line bg-panel/95 px-3 py-1 text-left backdrop-blur hover:bg-hover"
+      title={path}
+    >
+      <Chevron className={`shrink-0 text-ink-3 ${open ? "rotate-90" : ""}`} width={12} height={12} />
+      <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-ink-2">{path.startsWith("/") ? baseName(path) : path}</span>
+      <StateSummary sessions={sessions} />
+    </button>
   );
 }
 
@@ -118,11 +141,14 @@ export function SessionList(props: {
   const search = useStore((s) => s.search);
   const provider = useStore((s) => s.providerFilter);
   const group = useStore((s) => s.groupFilter);
+  const collapsed = useStore((s) => s.collapsedFolders);
   const selectedId = useStore((s) => s.selectedId);
   const endedOpen = useStore((s) => s.endedOpen);
   const backgroundOpen = useStore((s) => s.backgroundOpen);
   const lastSeen = useStore((s) => s.lastSeen);
+  const lastAssistantEvent = useStore((s) => s.lastAssistantEvent);
   const autoPending = useStore((s) => s.autoPending);
+  useStore((s) => s.coordination.tasks); // workers go by their task's title: redraw when tasks arrive
   const now = useNow();
 
   useEffect(() => {
@@ -131,13 +157,15 @@ export function SessionList(props: {
   }, [selectedId]);
 
   const open = (id: string) => selectSession(id, true);
-  const renderRow = (s: Session) => (
-    <SessionRow key={s.id} session={s} selected={s.id === selectedId} unread={isUnread(lastSeen, s)}
+  const renderRow = (s: Session, heading?: string) => (
+    <SessionRow key={s.id} session={s} title={sessionTitle(s)} selected={s.id === selectedId} unread={isUnread(lastSeen, s, lastAssistantEvent)}
       attention={attention.get(s.id)}
-      autoDeadline={autoPending[s.id]?.deadline} now={now} onOpen={open} />
+      autoDeadline={autoPending[s.id]?.deadline} now={now} onOpen={open} heading={heading} />
   );
-  const endedShown = endedOpen || search.trim() !== "";
+  const endedShown = endedOpen || search.trim() !== "" || group === "unread";
   const backgroundShown = backgroundOpen || search.trim() !== "" || group !== "all";
+  const groupOptions = GROUP_OPTIONS.map((o) => o.id === "unread" ? { ...o, count: model.unreadCount } : o);
+  const projectOpen = (key: string) => !collapsed.includes(key) || search.trim() !== "" || group === "unread";
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-panel">
@@ -155,7 +183,7 @@ export function SessionList(props: {
           />
           <kbd className="pointer-events-none absolute right-2 top-1.5 rounded border border-line px-1 font-mono text-[10px] text-ink-3">/</kbd>
         </label>
-        <Segmented label="Show" value={group} options={GROUP_OPTIONS} onChange={setGroupFilter} />
+        <Segmented label="Show" value={group} options={groupOptions} onChange={setGroupFilter} />
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -165,8 +193,10 @@ export function SessionList(props: {
         )}
         {model.projects.map((p) => (
           <section key={p.key} aria-label={`Project ${p.label}`}>
-            <ProjectHeading path={p.label} count={p.sessions.length} />
-            <ul className="divide-y divide-line/60">{p.sessions.map(renderRow)}</ul>
+            <ProjectHeading path={p.label} sessions={p.sessions} open={projectOpen(p.key)} onToggle={() => toggleFolder(p.key)} />
+            {projectOpen(p.key) && (
+              <ul className="divide-y divide-line/60">{p.sessions.map((s) => renderRow(s, p.label.startsWith("/") ? baseName(p.label) : p.label))}</ul>
+            )}
           </section>
         ))}
         {model.background.length > 0 && (
@@ -176,11 +206,11 @@ export function SessionList(props: {
               aria-expanded={backgroundShown}
               className="flex w-full items-center gap-2 border-y border-line bg-panel px-3 py-1.5 text-left text-[12px] font-semibold text-ink-3 hover:text-ink-2"
             >
-              <Chevron className={backgroundShown ? "rotate-90" : ""} width={12} height={12} />
-              Background agents ({model.background.length})
-              {model.backgroundWaiting > 0 && <span className="font-normal text-amber">{model.backgroundWaiting} need{model.backgroundWaiting === 1 ? "s" : ""} you</span>}
+              <Chevron className={`shrink-0 ${backgroundShown ? "rotate-90" : ""}`} width={12} height={12} />
+              <span className="min-w-0 flex-1 truncate">Background agents</span>
+              <StateSummary sessions={model.background} />
             </button>
-            {backgroundShown && <ul className="divide-y divide-line/60">{model.background.map(renderRow)}</ul>}
+            {backgroundShown && <ul className="divide-y divide-line/60">{model.background.map((s) => renderRow(s))}</ul>}
           </section>
         )}
         {model.ended.length > 0 && (
@@ -194,7 +224,7 @@ export function SessionList(props: {
               Ended
               <span className="font-normal">{model.ended.length}</span>
             </button>
-            {endedShown && <ul className="divide-y divide-line/60">{model.ended.map(renderRow)}</ul>}
+            {endedShown && <ul className="divide-y divide-line/60">{model.ended.map((s) => renderRow(s))}</ul>}
           </section>
         )}
       </div>

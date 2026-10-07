@@ -1,33 +1,22 @@
-import type { AttentionItem, Provider, RunningCommand, Session } from "../../../shared/types.ts";
+import type { AttentionItem, RunningCommand, Session } from "../../../shared/types.ts";
 import { duration } from "../format.ts";
 import { KIND } from "../attention.ts";
 import { STATUS, statusLabel } from "../status.ts";
-import { ClaudeGlyph, CodexGlyph, OtherGlyph, StatusIcon } from "./Icons.tsx";
-
-export function ProviderGlyph({ provider, size = 14 }: { provider: Provider; size?: number }) {
-  const title = provider === "claude" ? "Claude Code" : provider === "codex" ? "Codex" : "Other agent";
-  const Glyph = provider === "claude" ? ClaudeGlyph : provider === "codex" ? CodexGlyph : OtherGlyph;
-  const color = provider === "claude" ? "text-[#d4a27f]" : provider === "codex" ? "text-[#8fd0c4]" : "text-ink-3";
-  return (
-    <span role="img" aria-label={title} title={title} className={`inline-flex shrink-0 ${color}`}>
-      <Glyph width={size} height={size} />
-    </span>
-  );
-}
+import { StatusIcon } from "./Icons.tsx";
 
 /** Idle only because a command it started is still going: say what's running instead of "Idle". */
 export const idleRunning = (s: Session) => (s.execution === "idle" ? s.resources?.running : undefined);
 
 export function StatusPill({ session, elapsed, large }: { session: Session; elapsed?: string; large?: boolean }) {
   const running = idleRunning(session);
-  const meta = running ? { label: RUNNING_LABEL[running.kind], tone: "blue" as const, icon: "spinner" as const } : STATUS[session.execution];
+  const meta = running ? { label: RUNNING_LABEL[running.kind], tone: "blue" as const, icon: "active" as const } : STATUS[session.execution];
   return (
     <span
       className={`pill tone-${meta.tone} inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full font-medium ${
         large ? "px-3.5 py-1.5 text-2xl" : "px-2 py-0.5 text-[11px]"
       }`}
     >
-      <StatusIcon name={meta.icon} spin={session.execution === "working" || !!running} width={large ? 24 : 12} height={large ? 24 : 12} />
+      <StatusIcon name={meta.icon} width={large ? 24 : 12} height={large ? 24 : 12} />
       {running ? meta.label : statusLabel(session)}
       {elapsed && <span className="font-mono tabular-nums opacity-80">{elapsed}</span>}
     </span>
@@ -80,7 +69,7 @@ const RUNNING_LABEL: Record<RunningCommand["kind"], string> = { tests: "Tests ru
 export function RunningChip({ running, now }: { running: RunningCommand; now: number }) {
   return (
     <span title={running.cmd} className="pill tone-blue inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-medium">
-      <StatusIcon name="spinner" spin width={11} height={11} />
+      <StatusIcon name="active" width={11} height={11} />
       {RUNNING_LABEL[running.kind]}
       <span className="font-mono tabular-nums opacity-80">{duration(Math.max(0, now - running.since))}</span>
     </span>

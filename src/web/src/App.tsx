@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { EndedToasts } from "./components/SessionActions.tsx";
 import { Inbox } from "./components/Inbox.tsx";
 import { Header } from "./components/Header.tsx";
 import { SessionList } from "./components/SessionList.tsx";
@@ -11,6 +12,7 @@ import { useCopyOnSelect } from "./copyOnSelect.ts";
 import { buildListModel } from "./sessionList.ts";
 import { bySession, countAttention, groupInbox, openItems } from "./attention.ts";
 import { COORDINATOR_ID, toggleInbox, setView, useStore } from "./store.ts";
+import { needsYouItems } from "../../shared/needs-you.ts";
 
 export function App() {
   const sessionsById = useStore((s) => s.sessions);
@@ -24,6 +26,9 @@ export function App() {
   const group = useStore((s) => s.groupFilter);
   const endedOpen = useStore((s) => s.endedOpen);
   const backgroundOpen = useStore((s) => s.backgroundOpen);
+  const mainSessionIds = useStore((s) => s.mainSessionIds);
+  const lastSeen = useStore((s) => s.lastSeen);
+  const lastAssistantEvent = useStore((s) => s.lastAssistantEvent);
   const attention = useStore((s) => s.attention);
   const inboxOpen = useStore((s) => s.inboxOpen);
   const groups = useStore((s) => s.groups);
@@ -34,12 +39,25 @@ export function App() {
   const sessions = useMemo(() => Object.values(sessionsById), [sessionsById]);
   const open = useMemo(() => openItems(attention), [attention]);
   const openBySession = useMemo(() => bySession(open), [open]);
-  const counts = useMemo(() => countAttention(open, sessions), [open, sessions]);
+  // The coordinator's cards and work waiting for "Looks good" count as needing you too (badge, tab title).
+  const coordinator = useStore((s) => s.coordinator);
+  const tasks = useStore((s) => s.coordination.tasks);
+  const needs = needsYouItems({ attention: Object.values(attention), coordinator, tasks, sessions: sessionsById });
+  const needsCount = needs.length;
+  const needsIds = needs.map((item) => item.id).join("\n");
+  // Keep resolved phone notifications in sync even while the inbox is closed.
+  useEffect(() => {
+    navigator.serviceWorker?.controller?.postMessage({ type: "needs-you", ids: needsIds ? needsIds.split("\n") : [] });
+  }, [needsIds]);
+  const counts = useMemo(() => {
+    const c = countAttention(open, sessions);
+    return { ...c, needYou: needsCount, open: needsCount };
+  }, [open, sessions, needsCount]);
   const inboxOrder = useMemo(() => groupInbox(open).flatMap((g) => g.items.map((i) => i.id)), [open]);
   // Rows move at most once a minute (or when you change the filter/search), not on every status change.
   const [order, setOrder] = useState<string[] | undefined>(undefined);
   const fullOrder = useRef<() => string[]>(() => []);
-  fullOrder.current = () => buildListModel(sessions, { search, provider, group, endedOpen: true, backgroundOpen: true, attention: openBySession }).orderedIds;
+  fullOrder.current = () => buildListModel(sessions, { search, provider, group, endedOpen: true, backgroundOpen: true, mainSessionIds, attention: openBySession, lastSeen, lastAssistantEvent }).orderedIds;
   useEffect(() => setOrder(fullOrder.current()), [search, provider, group]);
   // The first snapshot can predate the session list arriving: take one as soon as there is one.
   const hasSessions = sessions.length > 0;
@@ -51,8 +69,8 @@ export function App() {
     return () => clearInterval(t);
   }, []);
   const model = useMemo(
-    () => buildListModel(sessions, { search, provider, group, endedOpen, backgroundOpen, attention: openBySession, order }),
-    [sessions, search, provider, group, endedOpen, backgroundOpen, openBySession, order],
+    () => buildListModel(sessions, { search, provider, group, endedOpen, backgroundOpen, mainSessionIds, attention: openBySession, lastSeen, lastAssistantEvent, order }),
+    [sessions, search, provider, group, endedOpen, backgroundOpen, mainSessionIds, openBySession, lastSeen, lastAssistantEvent, order],
   );
 
   useAttentionChrome(counts.needYou, counts.finished > 0);
@@ -86,6 +104,7 @@ export function App() {
         </div>
         {inboxOpen && <Inbox />}
       </div>
+      <EndedToasts />
       {copied && (
         <div role="status" className="pointer-events-none fixed bottom-20 left-1/2 z-50 -translate-x-1/2 rounded-md bg-raised px-3 py-1 text-[12px] text-ink-2 shadow-lg ring-1 ring-line-strong">
           {copied}

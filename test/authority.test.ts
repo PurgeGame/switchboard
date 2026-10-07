@@ -11,6 +11,7 @@ import { blankSession } from "../src/daemon/state.ts";
 import { startHttp } from "../src/daemon/http.ts";
 import { canonical } from "../src/daemon/grants.ts";
 import type { Session, SbEvent } from "../src/shared/types.ts";
+import { withMessageLimits } from "./message-limits.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -34,7 +35,7 @@ function fixture() {
   const agent = new CoordinatorAgent({
     db: db.db,
     coordination: c,
-    cfg: mergeCoordinatorConfig({}),
+    cfg: mergeCoordinatorConfig(withMessageLimits()),
     sessions: () => sessions,
     events: () => [],
     send: async (id) => {

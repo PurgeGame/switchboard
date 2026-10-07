@@ -30,9 +30,9 @@ test("no coordinator: the home row is 'Needs you', counting prompts and waiting 
   expect(homeRow("none", null, [], {}).status).toBe("Nothing right now");
 });
 
-test("built-in and external: the coordinator row counts proposals, done tasks and prompts", () => {
+test("built-in and external: the coordinator row counts proposals, done tasks, prompts and questions", () => {
   const b = homeRow("builtin", coord(), tasks, attention);
-  expect(b).toMatchObject({ title: "Coordinator", waiting: 3, lamp: "on", status: "On" });
+  expect(b).toMatchObject({ title: "Coordinator", waiting: 4, lamp: "on", status: "On" });
   expect(homeRow("builtin", coord({ busy: true }), [], {})).toMatchObject({ lamp: "busy", status: "Thinking…" });
   const e = homeRow("external", coord({ agent: "external", busy: true }), [], {});
   expect(e).toMatchObject({ title: "Coordinator", lamp: "on", status: "On · your agent" }); // never "thinking": we can't see it

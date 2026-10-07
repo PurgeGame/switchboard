@@ -8,7 +8,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Claim, Conflict, Objective, SbEvent, Session, Task, HumanGrant, LaunchReservation } from "../shared/types.ts";
 import type { Store } from "./db.ts";
 import { canonical, dirIdentity, pathScope, resourceKey, requireGrant, requireTaskScope, verifyDir, within } from "./grants.ts";
@@ -17,6 +17,8 @@ import { validateChecks, verifyDeclaredCheck, evidenceRevision, launchRevision }
 /** Who is acting. Required everywhere: no path silently assumes human authority. */
 export type Actor = "human" | "coordinator";
 const ACTIVE_TASK = ["unassigned", "assigned", "in_progress"];
+/** Nothing more is dispatched for a task in these states: its claims and launch reservation go. */
+const FINISHED_TASK = ["verified", "rejected"];
 
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"]);
 export const SAME_FILE_WINDOW_MS = 60 * 60_000;
@@ -311,6 +313,8 @@ export class Coordination {
       priority: p.priority ?? "normal",
       tier: p.tier ?? "standard",
       tierReason: p.tierReason ?? null,
+      humanTierSelection: actor === "human" && p.tier !== undefined,
+      ...(p.recommendation ? { recommendation: p.recommendation } : {}),
       prerequisites: [...new Set(p.prerequisites ?? [])],
       acceptance: [...new Set(p.acceptance)],
       status: "unassigned",
@@ -350,6 +354,7 @@ export class Coordination {
       "priority",
       "tier",
       "tierReason",
+      "recommendation",
       "prerequisites",
       "acceptance",
       "status",
@@ -374,6 +379,7 @@ export class Coordination {
       .transaction(() => {
         const t: Task = structuredClone({ ...current, ...patch, updatedAt: Date.now() });
         if (actor === "human") t.humanRevision = (current.humanRevision ?? 0) + 1;
+        if (actor === "human" && patch.tier !== undefined) t.humanTierSelection = true;
         if (!Array.isArray(t.acceptance) || !t.acceptance.length || t.acceptance.some((a) => typeof a !== "string" || !a.trim()))
           throw Error("Task needs acceptance criteria");
         if (!["unassigned", "assigned", "in_progress", "blocked", "finished_unverified", "verified", "rejected"].includes(t.status))
@@ -423,12 +429,35 @@ export class Coordination {
         if (actor !== "human" && current.status === "verified" && t.status !== "verified")
           throw Error("Only the human may change the status of a verified task; propose it instead");
         this.saveTask(t);
+        if (FINISHED_TASK.includes(t.status) && !FINISHED_TASK.includes(current.status)) this.releaseFinished(t, actor);
         this.unblockDependents();
         this.audit(actor, "task_updated", { id, patch });
         return this.task(id)!;
       })
       .immediate();
   }
+  /** Reviewing completion records human intent, even if the owner or grant is no longer usable.
+   * This does not dispatch work, acquire claims or grant any new authority. */
+  rejectTaskWithFeedback(id: string, note: string, actor: Actor): Task {
+    if (actor !== "human") throw Error("Only the human may send back finished work");
+    const current = this.task(id);
+    if (!current) throw Error("unknown task");
+    if (current.status !== "finished_unverified") throw Error("Task is no longer awaiting review");
+    if (typeof note !== "string" || !note.trim()) throw Error("Feedback note required");
+    const at = Date.now();
+    const t: Task = {
+      ...current, status: "in_progress", updatedAt: at,
+      humanRevision: (current.humanRevision ?? 0) + 1,
+      feedback: [...(current.feedback ?? []), { at, by: "human", note: note.trim() }],
+      evidenceSince: at, verifiedEvidence: [], historicalVerified: undefined,
+    };
+    this.store.db.transaction(() => {
+      this.saveTask(t);
+      this.audit(actor, "task_rejected_with_feedback", { taskId: id, note: note.trim() });
+    }).immediate();
+    return t;
+  }
+
   /** Human reassignment: release what the previous owner holds for this task, and end its launch binding. */
   private releaseTaskClaims(t: Task, owner: string) {
     const released: number[] = [];
@@ -516,6 +545,8 @@ export class Coordination {
     } else if (t.status === "verified") t.status = "finished_unverified";
     t.updatedAt = Date.now();
     this.saveTask(t);
+    // Verified only on your evidence or a daemon-checked declared check: yours to release.
+    if (t.status === "verified" && !FINISHED_TASK.includes(old.status)) this.releaseFinished(t, "human");
     this.audit(actor, "evidence_recorded", { taskId: id, evidence });
     this.unblockDependents();
     return t;
@@ -527,6 +558,39 @@ export class Coordination {
       .run(t.id, JSON.stringify(t));
     this.changed();
   }
+  /**
+   * A task just became verified or rejected: nothing more is dispatched for it, so the claims tagged
+   * with it and its launch reservation (with that reservation's claims) are released, audited, and
+   * waiting claims and queued plan tasks can go. `by` "human": your rejection, or a verification
+   * (only your evidence or a daemon-checked declared check verifies): everything goes. "coordinator":
+   * the coordinator rejected its own task, which frees only what it could release itself: claims of
+   * sessions it runs (coordinatorMayRelease), never a session you drive, and never an uncertain
+   * launch reservation (P1-A6: that one needs a look first).
+   */
+  private releaseFinished(t: Task, by: Actor) {
+    const human = by === "human";
+    const r = this.reservation(t.id);
+    const keepReservation = !!r && !human && (r.state === "uncertain" || (!!r.sessionId && !this.coordinatorMayRelease(r.sessionId)));
+    const holder = r ? `reservation:${r.id}` : null;
+    const released: number[] = [],
+      kept: number[] = [];
+    for (const c of this.claims(["active", "suspect", "waiting"])) {
+      if (c.taskId !== t.id && c.owner !== holder) continue;
+      const may = c.owner === holder ? !keepReservation : human || this.coordinatorMayRelease(c.owner);
+      if (!may) {
+        kept.push(c.id);
+        continue;
+      }
+      this.release(c.id, "human");
+      released.push(c.id);
+    }
+    const dropped = !!r && !keepReservation;
+    if (dropped) this.store.db.query("DELETE FROM launch_reservations WHERE task_id=?").run(t.id);
+    if (released.length || kept.length || r)
+      this.audit(by === "human" ? "daemon" : "coordinator", "released_on_finish", { taskId: t.id, status: t.status, by, claims: released, kept, reservation: dropped ? r : null });
+  }
+  /** Whose claims a coordinator rejection may release (the coordinator agent sets this: sessions it runs). */
+  coordinatorMayRelease: (owner: string) => boolean = () => false;
   blockedBy(t: Task): string[] {
     return t.prerequisites.filter((id) => !this.task(id) || !this.isVerified(this.task(id)!));
   }
@@ -581,10 +645,41 @@ export class Coordination {
       return false;
     }
   }
-  claimTask(t: Task, owner: string) {
+  /**
+   * What a task's worker claims. In a worktree of its own (`tree`, a directory outside the shared
+   * tree), its scope's paths inside that worktree, its own copy of those files: parallel tasks then
+   * meet only when their branches merge, not on the shared tree. Anywhere else (no worktree, a
+   * session you drive, any directory inside the shared tree), the scope paths themselves.
+   * "pending": a worktree launch whose worktree doesn't exist yet claims no paths until it does
+   * (checkReservation). Non-path resources (ports, branches) are shared and claimed as they are.
+   */
+  taskResources(t: Task, tree: string | null | "pending"): string[] {
+    const root = (t.objectiveId ? this.objective(t.objectiveId)?.grant?.root : undefined) ?? null;
+    const own = tree !== "pending" && !!tree && !!root && !within(tree, root);
+    const paths = tree === "pending" ? [] : t.scope.paths.map((p) => "path:" + (own && within(p, root!) ? join(tree!, relative(root!, p)) : p));
+    return [...paths, ...t.scope.resources];
+  }
+  /**
+   * The worktree the owner works in for this task, or null (the shared tree). Only a launch that
+   * binds this exact owner to its recorded, still-identical directory, which it is working in,
+   * counts (as assertRecipient's isolation): never the task's `worktree` field, which a
+   * reassignment leaves behind.
+   */
+  ownerTree(t: Task, owner: string): string | null {
+    const r = this.reservation(t.id),
+      s = this.session(owner),
+      g = t.objectiveId ? this.objective(t.objectiveId)?.grant : undefined;
+    if (!r || !s?.cwd || !g || g.revokedAt || !this.launchBinding(r, owner, g)) return null;
+    try {
+      return r.cwd === canonical(s.cwd) && !within(r.cwd!, g.root) ? r.cwd! : null;
+    } catch {
+      return null;
+    }
+  }
+  claimTask(t: Task, owner: string, tree: string | null | "pending" = this.ownerTree(t, owner)) {
     this.store.db
       .transaction(() => {
-        for (const resource of [...t.scope.paths.map((p) => "path:" + p), ...t.scope.resources]) {
+        for (const resource of this.taskResources(t, tree)) {
           const r = this.claim(owner, resource, { taskId: t.id });
           if (!r.granted) throw Error(`Dispatch blocked by claim ${r.blockedBy!.id} owned by ${r.blockedBy!.owner}`);
         }
@@ -614,17 +709,25 @@ export class Coordination {
     if (released.length) this.audit("coordinator", "prerequisite_claims_released", { taskId: t.id, claims: released });
     return released;
   }
-  /** Read-only: a held claim that would block claiming this task's scope right now, if any. */
-  scopeBlocker(t: Task): Claim | null {
+  /**
+   * Read-only: a held claim that would block claiming this task's scope right now, if any.
+   * `inWorktree`: it would launch into a new worktree, so only its shared resources can be blocked.
+   */
+  scopeBlocker(t: Task, inWorktree = false): Claim | null {
     const held = this.claims(["active", "suspect"]);
-    for (const resource of [...t.scope.paths.map((p) => "path:" + p), ...t.scope.resources]) {
+    for (const resource of this.taskResources(t, inWorktree ? "pending" : null)) {
       const key = resourceKey(resource);
       const b = held.find((c) => c.taskId !== t.id && overlaps(this.placed(c), key));
       if (b) return b;
     }
     return null;
   }
-  /** Shared pre-dispatch hook for messages, assignment and eventual perspective/auto entrypoints. */
+  /**
+   * Shared pre-dispatch hook for messages and checkpoints to a task's worker: the task, its grant and
+   * the recipient must hold, and its claims are (re)taken where the worker works. A worker in a
+   * worktree of its own claims inside it, so another session's claim never blocks a message to it;
+   * an owner in the shared tree is gated as before (a message can set it editing files someone else holds).
+   */
   checkDispatch(taskId: string, owner: string) {
     const t = this.task(taskId);
     if (!t || t.owner !== owner) throw Error("Dispatch needs a task owned by the recipient");
@@ -639,8 +742,11 @@ export class Coordination {
   reservations(): LaunchReservation[] {
     return (this.store.db.query("SELECT data FROM launch_reservations").all() as any[]).map((r) => JSON.parse(r.data));
   }
-  /** Reserve a launch into the grant root. The caller must then use `r.root`, never its own `repo` string. */
-  reserveLaunch(taskId: string, repo: string): LaunchReservation {
+  /**
+   * Reserve a launch into the grant root. The caller must then use `r.root`, never its own `repo` string.
+   * `worktree`: it launches into a worktree of its own, which claims its paths there once created.
+   */
+  reserveLaunch(taskId: string, repo: string, worktree = false): LaunchReservation {
     return this.store.db
       .transaction(() => {
         const t = this.task(taskId);
@@ -659,7 +765,7 @@ export class Coordination {
           at: Date.now(),
           root: g.root,
         };
-        this.claimTask(t, `reservation:${r.id}`);
+        this.claimTask(t, `reservation:${r.id}`, worktree ? "pending" : null);
         this.store.db.query("INSERT INTO launch_reservations VALUES(?,?)").run(taskId, JSON.stringify(r));
         this.audit("coordinator", "launch_reserved", r);
         return r;
@@ -688,6 +794,23 @@ export class Coordination {
    */
   clearReservation(taskId: string, input: { as: "not_launched" | "launched"; sessionId?: string | null }, actor: Actor) {
     if (actor !== "human") throw Error("Only the human may clear a launch reservation");
+    return this.settleReservation(taskId, input, actor);
+  }
+  /**
+   * The coordinator settles a launch whose outcome is unknown, after the daemon checked the
+   * reserved folder (CoordinatorAgent.resolveLaunch): "launched" binds the one live session working
+   * there; "not_launched" when no session ever worked there. Never a launch that completed, and
+   * never one still in flight (`inFlight`). Same effects as your clearReservation, audited as the
+   * coordinator's.
+   */
+  settleUncertainLaunch(taskId: string, input: { as: "not_launched" | "launched"; sessionId?: string | null }, inFlight: boolean) {
+    const r = this.reservation(taskId);
+    if (!r) throw Error("This task has no launch reservation");
+    if (r.state === "launched") throw Error("Its launch already completed");
+    if (inFlight) throw Error(`Its launch is still ${r.state}`);
+    return this.settleReservation(taskId, input, "coordinator");
+  }
+  private settleReservation(taskId: string, input: { as: "not_launched" | "launched"; sessionId?: string | null }, actor: Actor) {
     if (input?.as !== "not_launched" && input?.as !== "launched") throw Error('as must be "not_launched" or "launched"');
     return this.store.db
       .transaction(() => {
@@ -708,7 +831,7 @@ export class Coordination {
               ...t,
               owner: null,
               status: ACTIVE_TASK.includes(t.status) ? "unassigned" : t.status,
-              humanRevision: (t.humanRevision ?? 0) + 1,
+              ...(actor === "human" ? { humanRevision: (t.humanRevision ?? 0) + 1 } : {}),
               updatedAt: Date.now(),
             });
           this.audit(actor, "reservation_cleared", { taskId, as: input.as, reservation: r, released });
@@ -747,12 +870,16 @@ export class Coordination {
   updateReservation(r: LaunchReservation) {
     this.store.db.query("UPDATE launch_reservations SET data=? WHERE task_id=?").run(JSON.stringify(r), r.taskId);
   }
-  checkReservation(r: LaunchReservation) {
+  /**
+   * `cwd`: the directory the worker will run in; its claims are taken there (taskResources: only a
+   * worktree outside the shared tree gets claims of its own, anything else claims the shared paths).
+   */
+  checkReservation(r: LaunchReservation, cwd: string | null = null) {
     const stored = this.reservation(r.taskId),
       t = this.task(r.taskId);
     if (!stored || stored.id !== r.id || !t || stored.revision !== launchRevision(t) || this.assertTaskReady(t).id !== r.grantId)
       throw Error("Launch authority changed; reservation held for inspection");
-    this.claimTask(t, `reservation:${r.id}`);
+    this.claimTask(t, `reservation:${r.id}`, cwd);
   }
   finishLaunch(r: LaunchReservation, sessionId: string, cwd: string) {
     return this.store.db
@@ -857,6 +984,13 @@ export class Coordination {
     const result = tx.immediate();
     this.changed();
     return result;
+  }
+
+  /** Explicitly closing a session releases every claim, including queued ones. */
+  releaseSessionClaims(sessionId: string): number[] {
+    const ids = this.claims(["active", "suspect", "waiting"]).filter((c) => c.owner === sessionId).map((c) => c.id);
+    for (const id of ids) this.release(id, sessionId);
+    return ids;
   }
 
   release(claimId: number, by: string): Claim[] {

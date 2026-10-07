@@ -9,7 +9,7 @@ export function JumpToTerminal({ session }: { session: Session }) {
   const [done, setDone] = useState(false);
   if (!hasTerminal(session)) return null;
   return (
-    <span className="inline-flex items-center gap-2">
+    <span className="hidden items-center gap-2 sm:inline-flex [@media(any-pointer:coarse)]:hidden">
       <button
         onClick={() => {
           setError(null);

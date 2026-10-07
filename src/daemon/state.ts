@@ -22,8 +22,27 @@ export function blankSession(id: string, provider: Session["provider"], kind: Se
 /** Apply one transcript event. Returns true if the session changed. */
 export function applyEvent(s: Session, e: SbEvent): boolean {
   const before = JSON.stringify([s.execution, s.turnStartedAt, s.lastActivityAt, s.lastAssistantText, s.firstPrompt, s.goal]);
-  if (CONTENT.includes(e.type)) s.lastActivityAt = Math.max(s.lastActivityAt ?? 0, e.ts);
+  if (CONTENT.includes(e.type)) {
+    // Preserve the progress baseline in snapshots from before progress was tracked separately.
+    if (typeof s.meta.lastProgressAt !== "number" && s.lastActivityAt !== null) {
+      s.meta.lastProgressAt = s.lastActivityAt;
+      s.meta.lastProgressType = s.meta.lastContentType;
+    }
+    s.lastActivityAt = Math.max(s.lastActivityAt ?? 0, e.ts);
+    s.meta.lastContentType = e.type;
+  }
   const text = typeof e.data.text === "string" ? e.data.text : "";
+  // A delivered checkpoint is our own input, not evidence that the worker made progress.
+  const coordinatorEcho = (e.type === "user_msg" || e.type === "peer_msg") && text.replace(/<\/?pasted_content[^>]*>/g, "").trim().startsWith("[coordinator]");
+  if (coordinatorEcho || e.type === "coordinator_msg") s.meta.lastCoordinatorInputAt = e.ts;
+  const checkpointTurn = e.type === "turn_started" && s.meta.lastCoordinatorInputAt === e.ts;
+  if (CONTENT.includes(e.type) && !["coordinator_msg", "auto_msg", "queued_input"].includes(e.type) && !coordinatorEcho && !checkpointTurn && e.ts >= (stallActivityAt(s) ?? 0)) {
+    s.meta.lastProgressAt = e.ts;
+    s.meta.lastProgressType = e.type;
+    if (e.type === "tool_call") s.meta.lastStep = stepSummary(e);
+    else if (text) s.meta.lastStep = clip(text.replace(/\s+/g, " "), 300);
+    else if (e.type !== "tool_result") s.meta.lastStep = e.type;
+  }
 
   const startTurn = () => {
     if (s.turnStartedAt === null || !isRunning(s.execution)) s.turnStartedAt = e.ts;
@@ -117,20 +136,27 @@ export function mergeLiveStatus(s: Session, live: { execution: Execution; confid
   return before !== `${s.execution}|${s.turnStartedAt}|${s.executionConfidence}`;
 }
 
-/**
- * Working but silent for `stalledMs` and not using CPU -> suspected stalled (inferred).
- * A long-running command keeps the tree busy, so CPU use vetoes the stall.
- */
+export function stepSummary(e: SbEvent): string {
+  const text = e.type === "tool_call"
+    ? `${e.data.name ?? "tool"} ${e.data.summary ?? JSON.stringify(e.data.input ?? e.data.arguments ?? e.data.paths ?? "")}`
+    : String(e.data.text ?? e.type);
+  return clip(text.replace(/\s+/g, " "), 300);
+}
+
+export const stallActivityAt = (s: Session): number | null => typeof s.meta.lastProgressAt === "number" ? s.meta.lastProgressAt : s.lastActivityAt;
+
+/** Silence is only a lead for the coordinator. Waiting and live work always veto it. */
+export function canSuspectStall(s: Session): boolean {
+  return s.execution === "working"
+    && (s.meta.lastProgressType ?? s.meta.lastContentType) !== "turn_ended"
+    && (s.resources?.cpuPct ?? 0) < 5
+    && !s.resources?.running
+    && (s.resources?.liveChildren ?? Math.max(0, (s.resources?.procs ?? 1) - 1)) === 0
+    && !s.subagents?.some((a) => a.status === "running");
+}
+
+/** Does not change execution: unconfirmed suspicions are invisible to the user. */
 export function checkStalled(s: Session, now: number, stalledMs: number): boolean {
-  const cpu = s.resources?.cpuPct ?? 0;
-  const silentFor = s.lastActivityAt === null ? 0 : now - s.lastActivityAt;
-  if (s.execution === "working" && silentFor > stalledMs && cpu < 5) {
-    set(s, "stalled", "inferred");
-    return true;
-  }
-  if (s.execution === "stalled" && (silentFor <= stalledMs || cpu >= 5)) {
-    set(s, "working", "inferred");
-    return true;
-  }
-  return false;
+  const at = stallActivityAt(s);
+  return at !== null && now - at > stalledMs && canSuspectStall(s);
 }

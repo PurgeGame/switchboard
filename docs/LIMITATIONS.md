@@ -21,6 +21,7 @@ Precise and current as of Phase 7. "Verified" means exercised on this machine ag
 - **Uncertain deliveries need a human.** A message with no transcript receipt within 90 s becomes `uncertain` and is never retried. You must check the session and resend on purpose.
 - **Images:** Claude's TUI turns a pasted image path into a real attachment (verified); Codex terminal paths can only send a file reference as text (labeled "path" in the UI). The Codex daemon path sends a real `localImage`.
 - A raw-input endpoint exists only for terminals Switchboard launched itself.
+- **Managed terminal cleanup requires bridge 0.1.2, Linux and Python 3.** New launches use a dedicated process that exits only after the agent and surviving child work exit. Idle is never cleanup eligibility. Legacy interactive tabs cannot be safely reclaimed from old IDs/PIDs alone and remain open. See [terminal lifecycle](TERMINAL_LIFECYCLE.md) for the exact VS Code API limits, ownership checks, and End/Resume integration dependency.
 
 ## Hooks and interference
 

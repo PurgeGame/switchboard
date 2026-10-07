@@ -7,6 +7,8 @@ import type { SendMode } from "../../shared/types.ts";
 import type { CodexDaemonClient } from "./codex-daemon.ts";
 
 export interface CodexApproval {
+  /** Original approval payload; policy rejects execution options it does not understand. */
+  raw?: Record<string, unknown>;
   rpcId: number | string;
   threadId: string;
   method: string;
@@ -83,6 +85,7 @@ export class CodexLive {
     else if (method === "item/completed" && p.item?.type === "userMessage" && p.item.clientId) this.onReceipt(threadId, p.item.clientId);
     else if (id !== undefined && APPROVAL_METHODS.has(method)) {
       const a: CodexApproval = {
+        raw: p,
         rpcId: id,
         threadId,
         method,

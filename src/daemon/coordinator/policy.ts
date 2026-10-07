@@ -64,16 +64,27 @@ export interface RateLimits {
   dedupeWindowMs: number;
 }
 
-/** Outgoing-message gate: cooldown, hourly cap, near-duplicate drop. */
-export function checkSend(history: SentRecord[], sessionId: string, text: string, lim: RateLimits, now: number): { ok: true } | { ok: false; outcome: "refused" | "dropped"; reason: string } {
+/**
+ * Outgoing-message gate: cooldown, hourly cap, near-duplicate drop. noCooldown: the user asked for
+ * this message in chat (userChat), so the per-session cooldown doesn't apply; the near-duplicate
+ * drop and the hourly cap (a runaway backstop) still do.
+ */
+export function checkSend(
+  history: SentRecord[],
+  sessionId: string,
+  text: string,
+  lim: RateLimits,
+  now: number,
+  opts: { noCooldown?: boolean } = {},
+): { ok: true } | { ok: false; outcome: "refused" | "dropped"; reason: string } {
   const mine = history.filter((h) => h.sessionId === sessionId);
   const dup = mine.find((h) => now - h.at < lim.dedupeWindowMs && similarity(h.text, text) >= NEAR_IDENTICAL);
   if (dup) return { ok: false, outcome: "dropped", reason: `near-identical to a message sent ${Math.round((now - dup.at) / 60_000)} min ago` };
   const last = mine.reduce((m, h) => Math.max(m, h.at), 0);
-  if (last && now - last < lim.perSessionCooldownMs)
+  if (last && lim.perSessionCooldownMs > 0 && now - last < lim.perSessionCooldownMs && !opts.noCooldown)
     return { ok: false, outcome: "refused", reason: `cooldown: 1 message per ${Math.round(lim.perSessionCooldownMs / 60_000)} min per session (next allowed in ${Math.ceil((lim.perSessionCooldownMs - (now - last)) / 60_000)} min)` };
   const hour = mine.filter((h) => now - h.at < 3600_000).length;
-  if (hour >= lim.perSessionPerHour) return { ok: false, outcome: "refused", reason: `rate limit: ${lim.perSessionPerHour} messages per session per hour` };
+  if (lim.perSessionPerHour > 0 && hour >= lim.perSessionPerHour) return { ok: false, outcome: "refused", reason: `rate limit: ${lim.perSessionPerHour} messages per session per hour` };
   return { ok: true };
 }
 
@@ -198,4 +209,4 @@ export class RepeatDetector {
 }
 
 /** Tools that change anything. Read-only tools stay usable while paused. */
-export const READ_ONLY_TOOLS = new Set(["list_sessions", "get_session", "get_state", "get_resources", "get_group", "note", "get_updates", "get_instructions"]);
+export const READ_ONLY_TOOLS = new Set(["list_lessons", "list_sessions", "get_session", "get_state", "get_resources", "get_usage", "get_group", "note", "get_updates", "get_instructions"]);

@@ -41,10 +41,14 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-:focus-visible {
-  outline: 2px solid var(--color-focus);
-  outline-offset: 1px;
-  border-radius: 4px;
+/* In the base layer, so a control that draws its own focus (the message box: its border lights up)
+   can turn this off with focus-visible:outline-none. Unlayered, it beat every utility: two rings. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 1px;
+    border-radius: 4px;
+  }
 }
 
 ::-webkit-scrollbar {
@@ -83,16 +87,10 @@ body {
   0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-amber) 55%, transparent); }
   50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--color-amber) 0%, transparent); }
 }
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
 .lamp-pulse { animation: lamp 2.4s ease-in-out infinite; }
-.spin { animation: spin 1.1s linear infinite; }
 
 @media (prefers-reduced-motion: reduce) {
-  .lamp-pulse,
-  .spin {
+  .lamp-pulse {
     animation: none;
   }
   * {
@@ -133,3 +131,34 @@ body {
 .md table { border-collapse: collapse; display: block; overflow-x: auto; }
 .md th, .md td { border: 1px solid var(--color-line); padding: 0.25em 0.6em; }
 .md hr { border: 0; border-top: 1px solid var(--color-line); margin: 1em 0; }
+
+/* Needs you details stay complete; only this region scrolls, never the card's actions. */
+.needs-you-card > :not(.needs-you-content) { flex-shrink: 0; }
+.needs-you-content {
+  min-height: 0;
+  max-height: 40vh;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.needs-you-content::-webkit-scrollbar { width: 8px; }
+.needs-you-content::-webkit-scrollbar-thumb {
+  background: var(--color-ink-3);
+  border-color: var(--color-panel);
+}
+.needs-you-content::-webkit-scrollbar-track { background: var(--color-panel); }
+/* Custom WebKit scrollbars remain visible on touch devices. Standard scrollbar styling
+   overrides those rules in Chromium and restores an auto-hiding mobile scrollbar. */
+@supports not selector(::-webkit-scrollbar) {
+  .needs-you-content {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-ink-3) var(--color-panel);
+  }
+}
+.needs-you-text p, .needs-you-text li { white-space: pre-wrap; }
+.needs-you-text pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Fit an expanded inbox card below the app and inbox headers, including on short phones. */
+section[aria-label="Needs you"] .needs-you-card:has(> .needs-you-content) {
+  max-height: max(10rem, calc(100dvh - 10rem));
+}

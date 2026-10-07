@@ -107,14 +107,16 @@ describe("attention engine", () => {
     expect(engine.open(s.id)).toHaveLength(0);
   });
 
-  test("answering a held prompt in Switchboard settles every approval item for that session at once", () => {
-    const { engine, s } = setup();
-    // The registry sees the session waiting (one item), and the broker holds the prompt for you (another).
+  test("a held prompt upgrades the registry item in place, notifies once and settles once", () => {
+    const { engine, s, notified } = setup();
+    // Discovery and the broker see the same prompt: preserve its identity.
     s.execution = "waiting_approval";
     s.executionConfidence = "confirmed";
     engine.onExecutionChange(s, "working", NOW + 1);
     engine.raisePermission(s, { tool: "Bash", summary: "touch x", answerKey: "k1", recommendation: null });
-    expect(engine.open(s.id)).toHaveLength(2);
+    expect(engine.open(s.id)).toHaveLength(1);
+    expect(notified).toHaveLength(1);
+    expect(engine.open(s.id)[0].meta.answerKey).toBe("k1");
     engine.settlePermission("k1", "answered in Switchboard");
     expect(engine.open(s.id)).toHaveLength(0);
   });
@@ -137,4 +139,12 @@ describe("attention engine", () => {
     engine.onExecutionChange(s, prev, NOW + 4);
     expect(engine.open(s.id)).toHaveLength(0);
   });
+});
+
+test("an inferred stalled execution never raises attention", () => {
+  const { engine, s, store, notified } = setup();
+  s.execution = "stalled"; // a legacy snapshot/provider hint is not a coordinator verdict
+  engine.onExecutionChange(s, "working", NOW);
+  expect(store.openAttention(s.id)).toHaveLength(0);
+  expect(notified).toHaveLength(0);
 });

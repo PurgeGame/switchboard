@@ -28,6 +28,23 @@ interface ThreadInfo {
   status: any;
 }
 
+/** Shared-daemon subagents are threads, not necessarily child processes. Include every ancestor. */
+export function runningSubagentParents(threads: { id: string; parentThreadId: string | null; status: any }[]): Set<string> {
+  const byId = new Map(threads.map((t) => [t.id, t]));
+  const parents = new Set<string>();
+  for (const t of threads) {
+    if (["idle", "notLoaded", "systemError"].includes(t.status?.type)) continue;
+    const seen = new Set<string>([t.id]);
+    let parent = t.parentThreadId;
+    while (parent && !seen.has(parent)) {
+      parents.add(parent);
+      seen.add(parent);
+      parent = byId.get(parent)?.parentThreadId ?? null;
+    }
+  }
+  return parents;
+}
+
 export function codexExecution(status: any): { execution: Execution; detail: string } {
   if (!status) return { execution: "unknown", detail: "no status" };
   if (status.type === "active") {
@@ -85,11 +102,22 @@ export class CodexAdapter implements Adapter {
   readonly daemon: CodexDaemonClient;
   private claimed = new Set<number>();
   private threadCache = new Map<string, ThreadInfo>();
+  private subagentParents = new Set<string>();
+  private subagentStateKnown = false;
   private rolloutMeta = new Map<string, { id: string; cwd: string; originator: string | null; source: string | null }>();
   daemonPid: number | null = null;
+  /**
+   * TUI processes known for certain to host a thread (pid + its start time, so a reused pid
+   * doesn't match): Switchboard launched them for it. They count like `codex resume <id>`.
+   */
+  private pins = new Map<number, { threadId: string; startTime: number }>();
 
   constructor(sockPath = paths.codexControlSock) {
     this.daemon = new CodexDaemonClient(sockPath);
+  }
+
+  pin(threadId: string, pid: number, startTime: number) {
+    this.pins.set(pid, { threadId, startTime });
   }
 
   claimedPids() {
@@ -101,14 +129,20 @@ export class CodexAdapter implements Adapter {
   }
 
   private async daemonThreads(): Promise<ThreadInfo[]> {
+    this.subagentStateKnown = false;
     if (!(await this.daemon.ensure())) return [];
     const loaded = await this.daemon.call<{ data: string[] }>("thread/loaded/list", {});
     const out: ThreadInfo[] = [];
+    const families: { id: string; parentThreadId: string | null; status: any }[] = [];
+    let complete = true;
     await Promise.all(
       loaded.data.map(async (id) => {
         try {
           const { thread: t } = await this.daemon.call<{ thread: any }>("thread/read", { threadId: id, includeTurns: false });
-          if (t.ephemeral && !t.path) return;
+          const parentThreadId = t.parentThreadId ?? t.source?.subagent?.thread_spawn?.parent_thread_id ?? null;
+          families.push({ id, parentThreadId, status: t.status });
+          // Read even ephemeral children for the safety check; they don't own user terminals.
+          if (parentThreadId || (t.ephemeral && !t.path)) return;
           const info: ThreadInfo = {
             id,
             cwd: t.cwd,
@@ -123,9 +157,11 @@ export class CodexAdapter implements Adapter {
           };
           this.threadCache.set(id, info);
           out.push(info);
-        } catch {}
+        } catch { complete = false; }
       }),
     );
+    this.subagentParents = runningSubagentParents(families);
+    this.subagentStateKnown = complete;
     return out;
   }
 
@@ -177,6 +213,7 @@ export class CodexAdapter implements Adapter {
     const owners = this.rolloutOwners(codexProcs.map((p) => p.pid));
     const ownerPids = new Set(owners.values());
 
+    for (const [pid, pin] of this.pins) if (ctx.procs.get(pid)?.startTime !== pin.startTime) this.pins.delete(pid); // gone
     // TUI processes on the shared daemon: codex binary with a tty, no app-server, no rollout fd.
     const tuis = codexProcs
       .filter((p) => !ownerPids.has(p.pid))
@@ -184,7 +221,7 @@ export class CodexAdapter implements Adapter {
       .filter(({ cmd, tty }) => tty && !cmd.includes("app-server"))
       .map(({ p, cmd, tty }) => {
         const ri = cmd.indexOf("resume");
-        return { pid: p.pid, cwd: cwdOf(p.pid) ?? "", startMs: startedAtMs(p), resumeId: ri >= 0 ? cmd[ri + 1] : undefined, tty };
+        return { pid: p.pid, cwd: cwdOf(p.pid) ?? "", startMs: startedAtMs(p), resumeId: ri >= 0 ? cmd[ri + 1] : this.pins.get(p.pid)?.threadId, tty };
       });
 
     let threads: ThreadInfo[] = [];
@@ -229,7 +266,7 @@ export class CodexAdapter implements Adapter {
         liveStatus: { execution: st.execution, confidence: "confirmed", detail: st.detail },
         extraPids: extra,
         extraPidsInferred: sameCwd.length > 1,
-        meta: { originator: t.originator, preview: t.preview.slice(0, 300), onDaemon: true },
+        meta: { originator: t.originator, preview: t.preview.slice(0, 300), onDaemon: true, runningSubagents: this.subagentParents.has(t.id), subagentStateKnown: this.subagentStateKnown },
       });
     }
 

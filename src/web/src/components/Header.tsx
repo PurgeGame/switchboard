@@ -1,6 +1,7 @@
 import type { AttentionCounts } from "../attention.ts";
 import { InboxIcon } from "./Icons.tsx";
 import { GameModeBadge } from "./Governor.tsx";
+import { UsageChip } from "./Usage.tsx";
 import { SettingsPopover } from "./SettingsPopover.tsx";
 import { useStore, type ConnState, type View } from "../store.ts";
 import { gb } from "../format.ts";
@@ -61,16 +62,6 @@ function Segment({ n, label, color }: { n: number; label: string; color: string 
   );
 }
 
-function AttentionCounter({ counts }: { counts: AttentionCounts }) {
-  const { needYou } = counts;
-  return (
-    <div className="flex min-w-0 items-center gap-2 whitespace-nowrap text-[12px] font-medium" role="status" aria-live="polite">
-      <span aria-hidden className={`h-2.5 w-2.5 shrink-0 rounded-full ${needYou > 0 ? "lamp-pulse bg-amber" : "bg-line-strong"}`} />
-      <span className={`hidden sm:inline ${needYou > 0 ? "text-amber" : "text-ink-3"}`}>{needYou > 0 ? `${needYou} need${needYou === 1 ? "s" : ""} you` : "All clear"}</span>
-    </div>
-  );
-}
-
 const CONN_LABEL: Record<ConnState, string> = {
   open: "Live",
   connecting: "Connecting…",
@@ -102,25 +93,19 @@ export function Header(props: {
       <h1 className="sr-only text-[14px] font-semibold tracking-tight sm:not-sr-only">Switchboard</h1>
       <Gauges />
       <div className="ml-auto flex items-center gap-2 sm:gap-4">
+        <UsageChip />
         <GameModeBadge />
-        <AttentionCounter counts={props.counts} />
         <button
           onClick={props.onInbox}
-          aria-label={`Waiting on you, ${props.counts.open} open`}
+          aria-label={`Inbox, ${props.counts.needYou} ${props.counts.needYou === 1 ? "item needs" : "items need"} you`}
           aria-expanded={props.inboxOpen}
-          title="What sessions are waiting on (i)"
-          className={`relative rounded-md p-1.5 hover:bg-hover ${props.inboxOpen ? "bg-raised text-ink" : "text-ink-2"}`}
+          aria-controls="attention-inbox"
+          title="Needs you and attention history (i)"
+          className={`relative flex min-h-11 min-w-11 items-center justify-center gap-1 rounded-md px-1.5 hover:bg-hover ${props.inboxOpen ? "bg-raised" : ""} ${props.counts.needYou > 0 ? "text-amber" : "text-ink-2"}`}
         >
           <InboxIcon width={16} height={16} />
-          {props.counts.open > 0 && (
-            <span
-              className={`absolute -right-1 -top-1 min-w-4 rounded-full px-1 text-center text-[10px] font-semibold leading-4 text-[#10141a] ${
-                props.counts.needYou > 0 ? "bg-amber" : "bg-green"
-              }`}
-            >
-              {props.counts.open}
-            </span>
-          )}
+          {props.counts.needYou > 0 && <span aria-hidden className="rounded-full bg-amber/15 px-1 text-[11px] font-semibold tabular-nums">{props.counts.needYou > 99 ? "99+" : props.counts.needYou}</span>}
+          <span role="status" className="sr-only">{props.counts.needYou} {props.counts.needYou === 1 ? "item needs" : "items need"} you</span>
         </button>
         <SettingsPopover />
         <ConnDot conn={props.conn} authError={props.authError} />

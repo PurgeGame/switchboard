@@ -23,7 +23,13 @@ const PATHS: Record<IconName, React.ReactNode> = {
     </>
   ),
   shield: <path d="M8 1.8 13 3.6v4c0 3-2.1 5.2-5 6.6-2.9-1.4-5-3.6-5-6.6v-4L8 1.8ZM5.8 8l1.6 1.6L10.4 6.4" />,
-  spinner: <path d="M8 1.8a6.2 6.2 0 1 0 6.2 6.2" />,
+  // Working: a ring with a solid centre, still (no spinning anywhere); its blue says it's active.
+  active: (
+    <>
+      <circle cx="8" cy="8" r="6.2" />
+      <circle cx="8" cy="8" r="2.6" fill="currentColor" stroke="none" />
+    </>
+  ),
   warn: <path d="M8 2.2 14.2 13H1.8L8 2.2ZM8 6.6v3M8 11.4v.1" />,
   cross: (
     <>
@@ -59,34 +65,10 @@ const PATHS: Record<IconName, React.ReactNode> = {
   moon: <path d="M12.8 9.6A5.6 5.6 0 0 1 6.4 3.2a5.6 5.6 0 1 0 6.4 6.4Z" />,
 };
 
-export function StatusIcon({ name, spin, ...rest }: { name: IconName; spin?: boolean } & P) {
+export function StatusIcon({ name, ...rest }: { name: IconName } & P) {
   return (
-    <svg {...base} {...rest} className={`${spin ? "spin" : ""} ${rest.className ?? ""}`}>
+    <svg {...base} {...rest}>
       {PATHS[name]}
-    </svg>
-  );
-}
-
-export function ClaudeGlyph(props: P) {
-  return (
-    <svg {...base} {...props} strokeWidth={1.7}>
-      <path d="M8 2v12M2 8h12M3.8 3.8l8.4 8.4M12.2 3.8l-8.4 8.4" />
-    </svg>
-  );
-}
-
-export function CodexGlyph(props: P) {
-  return (
-    <svg {...base} {...props}>
-      <path d="m5.4 4.6-3 3.4 3 3.4M10.6 4.6l3 3.4-3 3.4" />
-    </svg>
-  );
-}
-
-export function OtherGlyph(props: P) {
-  return (
-    <svg {...base} {...props}>
-      <rect x="2.6" y="2.6" width="10.8" height="10.8" rx="2.4" />
     </svg>
   );
 }

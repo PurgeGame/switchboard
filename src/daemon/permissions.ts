@@ -1,3 +1,5 @@
+// Production installs safeDecision from permission-policy.ts; it is authoritative and never
+// falls back to a model. The older D29 judge below remains for legacy broker callers/tests.
 // Permission prompts, decided by the coordinator (the user's choice, recorded as D29):
 // 1. A fixed always-ask list (deterministic, below) always goes to the human.
 // 2. Otherwise, while the coordinator is on and the session isn't excluded, a tool-free model
@@ -28,6 +30,7 @@ export interface PermissionInfo {
 }
 
 export interface Verdict {
+  rule?: string;
   decision: "allow" | "ask";
   reason: string;
 }
@@ -559,6 +562,8 @@ interface Pending {
 }
 
 export interface BrokerDeps {
+  /** Authoritative deterministic policy: no model fallback when installed. */
+  safeDecision?: (info: PermissionInfo) => Verdict;
   /** Hold a prompt for the human for this long before falling back to the terminal dialog. */
   holdMs: () => number;
   /** Is the coordinator on (active), and may it judge this session? */
@@ -566,8 +571,9 @@ export interface BrokerDeps {
   /** Folders this session may touch: its cwd and any granted task roots. */
   roots: (info: PermissionInfo) => string[];
   judge: (info: PermissionInfo) => Promise<Verdict | null>;
-  /** Show the prompt to the human (attention item with answerKey). Returns nothing. */
-  raise: (info: PermissionInfo, answerKey: string, recommendation: string | null) => void;
+  checking?: (sessionId: string, checking: boolean) => void;
+  /** Show the prompt to the human (attention item with answerKey). `questions`: it's an AskUserQuestion. */
+  raise: (info: PermissionInfo, answerKey: string, recommendation: string | null, questions: AskedQuestion[] | null) => void;
   /** The prompt is settled (answered, auto-approved, timed out, cancelled). */
   settle: (answerKey: string, how: string) => void;
   /** Record an automatic decision so it is visible. */
@@ -577,6 +583,59 @@ export interface BrokerDeps {
 const claudeAllow = () => ({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
 const claudeDeny = (message: string) => ({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message } } });
 
+/** Claude's multiple-choice tool. It asks the user, so it reaches the permission hook, but it's a question, not a permission. */
+export const ASK_USER_QUESTION = "AskUserQuestion";
+
+export interface AskedQuestion {
+  question: string;
+  header?: string;
+  options: { label: string; description?: string }[];
+  multiSelect: boolean;
+}
+
+/** The questions of an AskUserQuestion prompt as its card shows them, or null when the input isn't one. */
+export function askedQuestions(input: Record<string, unknown>): AskedQuestion[] | null {
+  const qs = input?.questions;
+  if (!Array.isArray(qs) || qs.length < 1 || qs.length > 4) return null;
+  const out: AskedQuestion[] = [];
+  for (const q of qs as any[]) {
+    if (!q || typeof q !== "object" || typeof q.question !== "string" || !q.question.trim()) return null;
+    const options = (Array.isArray(q.options) ? q.options : [])
+      .filter((o: any) => o && typeof o.label === "string" && o.label.trim())
+      .map((o: any) => ({ label: o.label as string, ...(typeof o.description === "string" && o.description ? { description: o.description as string } : {}) }));
+    out.push({ question: q.question, ...(typeof q.header === "string" && q.header ? { header: q.header } : {}), options, multiSelect: q.multiSelect === true });
+  }
+  return new Set(out.map((q) => q.question)).size === out.length ? out : null;
+}
+
+/**
+ * The hook's reply carrying the user's answers to an AskUserQuestion prompt: allow, with `answers`
+ * added to the input. Claude Code (checked against 2.1.292) admits a hook's updatedInput for this
+ * tool only if every field its card showed (title, questions, metadata) comes back unchanged and
+ * the new `answers` map each question's text to one string: the picked label, several joined with
+ * ", ", or the user's own words. Every question must be answered.
+ */
+export function questionAnswerReply(input: Record<string, unknown>, answers: unknown): object {
+  const qs = askedQuestions(input);
+  if (!qs) throw new Error("this prompt isn't a question");
+  if (!answers || typeof answers !== "object" || Array.isArray(answers)) throw new Error("answers must map each question to an answer");
+  const out: Record<string, string> = {};
+  for (const [question, a] of Object.entries(answers as Record<string, unknown>)) {
+    if (!qs.some((q) => q.question === question)) throw new Error(`no such question: ${question.slice(0, 80)}`);
+    if (typeof a !== "string" || !a.trim()) throw new Error("every answer needs some text");
+    if (a.length > 4000) throw new Error("that answer is too long");
+    out[question] = a.trim();
+  }
+  const missing = qs.find((q) => !(q.question in out));
+  if (missing) throw new Error(`answer every question (missing: ${missing.question.slice(0, 80)})`);
+  const shown = {
+    ...(typeof input.title === "string" && input.title ? { title: input.title } : {}),
+    questions: input.questions,
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+  };
+  return { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: { ...shown, answers: out } } } };
+}
+
 export class PermissionBroker {
   private pending = new Map<string, Pending>();
 
@@ -584,16 +643,26 @@ export class PermissionBroker {
 
   /** First pass, shared by both providers: allow automatically, or a reason to ask the human. */
   async decide(info: PermissionInfo): Promise<{ allow: boolean; recommendation: string | null }> {
-    const hard = alwaysAsk(info, this.d.roots(info));
-    if (hard) return { allow: false, recommendation: `Needs you: ${hard}.` };
-    if (!this.d.mayJudge(info.sessionId)) return { allow: false, recommendation: null };
-    const v = await this.d.judge(info).catch(() => null);
-    if (!v) return { allow: false, recommendation: null };
-    if (v.decision === "allow") {
-      this.d.logAuto(info, v);
-      return { allow: true, recommendation: v.reason };
+    this.d.checking?.(info.sessionId, true);
+    try {
+      if (this.d.safeDecision) {
+        const v = this.d.safeDecision(info);
+        if (v.decision === "allow") this.d.logAuto(info, v);
+        return { allow: v.decision === "allow", recommendation: v.reason };
+      }
+      const hard = alwaysAsk(info, this.d.roots(info));
+      if (hard) return { allow: false, recommendation: `Needs you: ${hard}.` };
+      if (!this.d.mayJudge(info.sessionId)) return { allow: false, recommendation: null };
+      const v = await this.d.judge(info).catch(() => null);
+      if (!v) return { allow: false, recommendation: null };
+      if (v.decision === "allow") {
+        this.d.logAuto(info, v);
+        return { allow: true, recommendation: v.reason };
+      }
+      return { allow: false, recommendation: v.reason };
+    } finally {
+      this.d.checking?.(info.sessionId, false);
     }
-    return { allow: false, recommendation: v.reason };
   }
 
   /**
@@ -601,10 +670,11 @@ export class PermissionBroker {
    * the terminal dialog appear (nobody answered in time, or the hook connection went away).
    */
   async claudeHook(info: PermissionInfo, signal?: AbortSignal): Promise<object | null> {
-    const first = await this.decide(info);
+    // A question for the user (AskUserQuestion) is never judged: it is theirs to answer.
+    const first = this.isQuestion(info) ? { allow: false, recommendation: null } : await this.decide(info);
     if (first.allow) return claudeAllow();
     const key = `claude-hook:${randomUUID()}`;
-    this.d.raise(info, key, first.recommendation);
+    this.d.raise(info, key, first.recommendation, this.isQuestion(info) ? askedQuestions(info.input) : null);
     return new Promise((done) => {
       const finish = (out: object | null, how: string) => {
         const p = this.pending.get(key);
@@ -624,8 +694,25 @@ export class PermissionBroker {
   answer(key: string, decision: HumanDecision): boolean {
     const p = this.pending.get(key);
     if (!p) return false;
-    p.resolve(decision === "accept" || decision === "acceptForSession" ? claudeAllow() : claudeDeny("Denied from Switchboard by the user."));
+    const yes = decision === "accept" || decision === "acceptForSession";
+    if (yes && this.isQuestion(p.info)) return false; // a question takes answers (answerQuestions), not a yes
+    p.resolve(yes ? claudeAllow() : claudeDeny("Denied from Switchboard by the user."));
     return true;
+  }
+
+  /**
+   * The human answered a held AskUserQuestion prompt: the answers go back to the session through
+   * the hook. False when it isn't (or is no longer) pending; throws when the answers don't fit.
+   */
+  answerQuestions(key: string, answers: unknown): boolean {
+    const p = this.pending.get(key);
+    if (!p || !this.isQuestion(p.info)) return false;
+    p.resolve(questionAnswerReply(p.info.input, answers));
+    return true;
+  }
+
+  private isQuestion(info: PermissionInfo) {
+    return info.provider === "claude" && info.tool === ASK_USER_QUESTION && askedQuestions(info.input) !== null;
   }
 
   isPending(key: string) {

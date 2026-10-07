@@ -39,7 +39,7 @@ async function startDaemon(name: string, agent: "external" | "none", simHome: st
   for (const d of [configDir, dataDir]) mkdirSync(d, { recursive: true, mode: 0o700 });
   writeFileSync(
     join(configDir, "config.json"),
-    JSON.stringify({ modelClassifier: false, autoContinue: { enabled: false }, notifyDesktop: false, remoteHost: null, permissionHoldMinutes: 1, coordinator: { agent } }),
+    JSON.stringify({ modelClassifier: false, autoContinue: { enabled: false }, notifyDesktop: false, remoteHost: null, permissionHoldMinutes: 1, autoApproveSafePermissions: true, coordinator: { agent } }),
     { mode: 0o600 },
   );
   const env = { ...process.env, SB_PORT: String(port), SB_DATA_DIR: dataDir, SB_CONFIG_DIR: configDir, SB_CLAUDE_HOME: simHome, SB_CODEX_HOME: join(simHome, "codex-none") } as Record<string, string>;
@@ -144,7 +144,7 @@ describe('coordinator.agent: "none"', () => {
     expect(listed).toBe(true);
   }, 30_000);
 
-  test("a permission prompt is never judged: it waits for the user, who can answer it", async () => {
+  test("an unresolved path waits for the user without a model, who can answer it", async () => {
     const hook = d.api("/api/hook/claude/PermissionRequest?wait=1", {
       method: "POST",
       body: JSON.stringify({ session_id: s.sessionId, tool_name: "Read", tool_input: { file_path: join(project, "a.txt") }, cwd: project }),
@@ -155,7 +155,7 @@ describe('coordinator.agent: "none"', () => {
       if (!item) await Bun.sleep(100);
     }
     expect(item).toBeTruthy();
-    expect(item.meta.recommendation).toBeNull(); // no coordinator opinion: nobody judged it
+    expect(item.meta.recommendation).toMatch(/unresolved|Unknown worktree/); // deterministic policy; no coordinator model
     expect((await d.api(`/api/attention/${item.id}/answer`, { method: "POST", body: JSON.stringify({ decision: "accept" }) })).status).toBe(200);
     const out = (await (await hook).json()) as any;
     expect(out.hookSpecificOutput.decision.behavior).toBe("allow");
@@ -176,6 +176,21 @@ describe('coordinator.agent: "external"', () => {
     expect(after.running).toBe(false);
     expect(after.activity.some((a: any) => a.action === "runtime")).toBe(false);
   }, 30_000);
+
+  test("auto-end settings are human-only, validated and applied without restarting", async () => {
+    const settings = { enabled: false, idleMinutes: 27 };
+    const saved = await d.api("/api/coordinator/auto-end", { method: "POST", body: JSON.stringify(settings) });
+    expect(saved.status).toBe(200);
+    expect(((await saved.json()) as any).autoEnd).toEqual(settings);
+    const bad = await d.api("/api/coordinator/auto-end", { method: "POST", body: JSON.stringify({ enabled: true, idleMinutes: 0 }) });
+    expect(bad.status).toBe(409);
+    const denied = await d.api("/api/coordinator/auto-end", {
+      method: "POST", body: JSON.stringify({ enabled: true, idleMinutes: 1 }),
+      headers: { authorization: `Bearer ${readFileSync(join(d.configDir, "coordinator-token"), "utf8").trim()}` },
+    });
+    expect(denied.status).toBe(403);
+    expect(((await (await d.api("/api/coordinator")).json()) as any).autoEnd).toEqual(settings);
+  });
 
   test("`sb mcp` lists the tools and get_updates drains the user's chat and events", async () => {
     const m = mcpClient(d);
@@ -216,5 +231,6 @@ describe('coordinator.agent: "external"', () => {
     const r = await m.tool("get_state");
     expect(r.isError).toBe(false); // mode is persisted (active), and the new token was picked up
     expect(r.body.budget).toBeTruthy();
+    expect(((await (await d.api("/api/coordinator")).json()) as any).autoEnd).toEqual({ enabled: false, idleMinutes: 27 });
   }, 45_000);
 });

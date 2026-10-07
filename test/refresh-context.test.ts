@@ -7,6 +7,7 @@ import { CoordinatorAgent } from "../src/daemon/coordinator/agent.ts";
 import { mergeCoordinatorConfig } from "../src/daemon/coordinator/config.ts";
 import { Store } from "../src/daemon/db.ts";
 import { blankSession } from "../src/daemon/state.ts";
+import { withMessageLimits } from "./message-limits.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => cleanup.splice(0).forEach((f) => f()));
@@ -24,7 +25,7 @@ function rig() {
   const agent = new CoordinatorAgent({
     db: store.db,
     coordination: new Coordination(store),
-    cfg: mergeCoordinatorConfig({}),
+    cfg: mergeCoordinatorConfig(withMessageLimits()),
     sessions: () => sessions,
     events: () => [],
     send: async () => ({ ok: true }),
